@@ -160,6 +160,7 @@ class MainWindow(QMainWindow):
         """Connect UI signals to slots."""
         # Media pool signals
         self.media_pool.import_requested.connect(self._on_import_media)
+        self.media_pool.add_to_timeline_requested.connect(self._on_media_double_clicked)
         self.media_pool.media_selected.connect(self._on_media_selected)
         self.media_pool.media_double_clicked.connect(self._on_media_double_clicked)
         self.media_pool.remove_requested.connect(self._on_remove_media)
@@ -168,6 +169,14 @@ class MainWindow(QMainWindow):
         self.preview.time_input_requested.connect(self._on_set_clip_range)
         self.preview.position_changed.connect(self._on_preview_position_changed)
         self.preview.process_clicked.connect(self._on_process_clip)
+        self.preview.play_clicked.connect(self._on_preview_play)
+        self.preview.pause_clicked.connect(self._on_preview_pause)
+        self.preview.stop_clicked.connect(self._on_preview_stop)
+        
+        # Timeline signals
+        self.timeline.clip_added_to_track.connect(self._on_clip_added_to_track)
+        self.timeline.position_changed.connect(self._on_timeline_position_changed)
+        self.timeline.clip_selected.connect(self._on_clip_selected_on_timeline)
         
         # Editor service signals
         self._editor_service.media_imported.connect(self._on_media_imported)
@@ -215,9 +224,20 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage(f"Selected: {media_info.name} ({media_info.resolution})")
     
     def _on_media_double_clicked(self, media_id: str):
-        """Handle media double click."""
+        """Handle media double click - add to timeline."""
         self._on_media_selected(media_id)
-        # Could auto-play or add to timeline
+        # Add the entire media to timeline at the end
+        media_info = self._editor_service.get_media(media_id)
+        if media_info:
+            # Add to timeline at the next available position
+            clip = self._editor_service.add_clip_to_timeline_auto(
+                media_id,
+                start_time=0.0,
+                end_time=media_info.duration
+            )
+            if clip:
+                self.timeline.add_clip_to_track(0, clip)
+                self.status_bar.showMessage(f"Added '{clip.name}' to timeline")
     
     def _on_remove_media(self, media_id: str):
         """Handle media removal."""
@@ -364,10 +384,98 @@ class MainWindow(QMainWindow):
             self.timeline.add_clip_to_track(0, clip)
             self.status_bar.showMessage(f"Added clip to timeline: {clip.name}")
     
+    def _on_clip_added_to_track(self, track_id: int, media_id: str, duration: float, timeline_start: float):
+        """Handle clip added to track via drag-and-drop.
+        
+        Args:
+            track_id: The track ID where the clip was dropped
+            media_id: The media ID of the dropped item
+            duration: Duration of the media in seconds
+            timeline_start: The timeline position where it was dropped
+        """
+        # Get the media info
+        media_info = self._editor_service.get_media(media_id)
+        if not media_info:
+            self.status_bar.showMessage(f"Error: Media {media_id} not found", 5000)
+            return
+        
+        # Add the clip to the timeline at the specified position
+        # Use the full media duration (0 to duration)
+        clip = self._editor_service.add_clip_to_timeline(
+            media_id,
+            start_time=0.0,
+            end_time=duration,
+            timeline_start=timeline_start
+        )
+        
+        if clip:
+            self.timeline.add_clip_to_track(track_id, clip)
+            self.status_bar.showMessage(f"Added '{clip.name}' to {self.timeline._tracks[track_id].track_name} at {self._format_time(timeline_start)}")
+
+    def _on_timeline_position_changed(self, position: float):
+        """Handle timeline position change (playhead moved)."""
+        # 1. Update preview widget time display
+        self.preview.set_position(position)
+        
+        # 2. Find if there's a clip under the playhead
+        all_clips = self._editor_service.get_timeline_clips()
+        clip_under_playhead = None
+        for clip in all_clips:
+            if clip.timeline_start <= position <= clip.timeline_start + clip.duration:
+                clip_under_playhead = clip
+                break
+        
+        if clip_under_playhead:
+            # Get media info for this clip
+            media_info = self._editor_service.get_media(clip_under_playhead.media_id)
+            if media_info:
+                # If it's not the current video in preview, load it
+                # But careful not to reload if already playing
+                if not self._current_media or self._current_media.media_id != media_info.media_id:
+                    self._on_media_selected(media_info.media_id)
+                
+                # Seek to the correct frame in the source media
+                source_pos = clip_under_playhead.start_time + (position - clip_under_playhead.timeline_start)
+                self.preview._media_player.setPosition(int(source_pos * 1000))
+    
+    def _on_clip_selected_on_timeline(self, clip_id: str):
+        """Handle clip selection on timeline."""
+        # Find the clip in service
+        all_clips = self._editor_service.get_timeline_clips()
+        for clip in all_clips:
+            if clip.clip_id == clip_id:
+                # Update service if needed
+                self._editor_service.move_clip(clip_id, clip.timeline_start)
+                break
+
     def _on_preview_position_changed(self, position: float):
-        """Handle preview position change."""
+        """Handle preview position change - sync with timeline."""
+        # Only update timeline if the change came from the player (not from timeline itself)
+        # This prevents feedback loops
         self.timeline.set_playhead_position(position)
     
+    def _on_preview_play(self):
+        """Handle preview play button - start timeline playback."""
+        # Get all timeline clips
+        timeline_clips = self._editor_service.get_timeline_clips()
+        if timeline_clips:
+            # Start timeline playback from current playhead position
+            current_pos = self.timeline._playhead_position
+            self.preview.start_timeline_playback(timeline_clips, current_pos)
+        elif self._current_media:
+            # No timeline clips, just play current media
+            pass  # Normal playback handled by preview widget
+    
+    def _on_preview_pause(self):
+        """Handle preview pause button."""
+        # Timeline playback pause is handled by the media player
+        pass
+    
+    def _on_preview_stop(self):
+        """Handle preview stop button - stop timeline playback."""
+        if self.preview.is_timeline_mode():
+            self.preview.stop_timeline_playback()
+
     def _on_timeline_updated(self):
         """Handle timeline updates."""
         # Refresh timeline display

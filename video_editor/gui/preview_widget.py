@@ -9,11 +9,12 @@ from PyQt6.QtWidgets import (
     QSlider, QFrame, QFileDialog, QSizePolicy, QLineEdit, QGroupBox
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QSize, QTimer, QUrl
-from PyQt6.QtGui import QImage, QPixmap
+from PyQt6.QtGui import QImage, QPixmap, QColor
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QVideoWidget
-from typing import Optional
+from typing import Optional, List, Callable
 from pathlib import Path
+import os
 
 
 class PreviewWidget(QWidget):
@@ -45,6 +46,14 @@ class PreviewWidget(QWidget):
         self._clip_end: float = 0.0
         self._current_file_path: Optional[str] = None
         self._slider_is_dragging: bool = False
+        
+        # Timeline playback state
+        self._timeline_mode: bool = False
+        self._timeline_clips: List = []
+        self._current_clip_index: int = -1
+        self._timeline_start_position: float = 0.0
+        self._gap_timer: Optional[QTimer] = None
+        self._black_screen: Optional[QWidget] = None
         
         self._setup_ui()
         self._setup_media_player()
@@ -93,6 +102,13 @@ class PreviewWidget(QWidget):
         self.video_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.video_widget.hide()
         preview_layout.addWidget(self.video_widget)
+        
+        # Black screen widget for gaps (hidden initially)
+        self._black_screen = QWidget()
+        self._black_screen.setStyleSheet("background-color: black;")
+        self._black_screen.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._black_screen.hide()
+        preview_layout.addWidget(self._black_screen)
         
         layout.addWidget(self.preview_container, stretch=1)
         
@@ -497,7 +513,157 @@ class PreviewWidget(QWidget):
             self._is_playing = True
         else:
             self._is_playing = False
+            # In timeline mode, check if we need to move to next clip
+            if self._timeline_mode and not self._slider_is_dragging:
+                self._check_timeline_advance()
         self._update_play_button()
+    
+    def _check_timeline_advance(self):
+        """Check if we need to advance to next clip in timeline mode."""
+        if not self._timeline_mode or self._current_clip_index < 0:
+            return
+        
+        current_clip = self._timeline_clips[self._current_clip_index]
+        clip_end_in_timeline = current_clip.timeline_start + current_clip.duration
+        
+        # Check if we've reached the end of current clip
+        if self._current_position >= current_clip.duration - 0.1:  # Small tolerance
+            self._advance_to_next_clip()
+    
+    def _advance_to_next_clip(self):
+        """Advance playback to next clip in timeline."""
+        self._current_clip_index += 1
+        
+        if self._current_clip_index >= len(self._timeline_clips):
+            # End of timeline
+            self.stop_timeline_playback()
+            return
+        
+        next_clip = self._timeline_clips[self._current_clip_index]
+        prev_clip = self._timeline_clips[self._current_clip_index - 1]
+        prev_end = prev_clip.timeline_start + prev_clip.duration
+        
+        # Check for gap
+        gap_duration = next_clip.timeline_start - prev_end
+        
+        if gap_duration > 0.1:  # Gap exists
+            self._show_black_screen(gap_duration)
+        else:
+            self._load_and_play_clip(next_clip)
+    
+    def _show_black_screen(self, duration: float):
+        """Show black screen for gap duration."""
+        self._media_player.pause()
+        self.video_widget.hide()
+        self._black_screen.show()
+        
+        # Use timer to advance after gap
+        if self._gap_timer is None:
+            self._gap_timer = QTimer(self)
+            self._gap_timer.setSingleShot(True)
+            self._gap_timer.timeout.connect(self._on_gap_finished)
+        
+        self._gap_timer.start(int(duration * 1000))
+    
+    def _on_gap_finished(self):
+        """Called when gap timer finishes."""
+        self._black_screen.hide()
+        if self._current_clip_index < len(self._timeline_clips):
+            self._load_and_play_clip(self._timeline_clips[self._current_clip_index])
+    
+    def _load_and_play_clip(self, clip):
+        """Load and play a specific clip."""
+        from PyQt6.QtCore import QUrl
+        
+        self._black_screen.hide()
+        self.video_widget.show()
+        
+        # Load the media file
+        media_path = clip.file_path if hasattr(clip, 'file_path') and clip.file_path else ""
+        if not media_path:
+            # Try to get from media_file attribute if it exists
+            if hasattr(clip, 'media_file') and clip.media_file:
+                media_path = clip.media_file.file_path
+        self._current_file_path = str(media_path)
+        
+        if not self._current_file_path or not os.path.exists(self._current_file_path):
+            # Skip this clip if file doesn't exist
+            self._advance_to_next_clip()
+            return
+        
+        url = QUrl.fromLocalFile(self._current_file_path)
+        self._media_player.setSource(url)
+        
+        # Seek to clip start position
+        start_ms = int(clip.start_time * 1000) if hasattr(clip, 'start_time') else 0
+        self._media_player.setPosition(start_ms)
+        
+        # Update UI
+        self.media_label.setText(clip.name)
+        self.placeholder_label.hide()
+        
+        # Start playback
+        self._media_player.play()
+    
+    def start_timeline_playback(self, clips: List, start_position: float = 0):
+        """Start playing the timeline from a specific position.
+        
+        Args:
+            clips: List of TimelineClip objects sorted by timeline_start
+            start_position: Timeline position to start from (seconds)
+        """
+        if not clips:
+            return
+        
+        self._timeline_mode = True
+        self._timeline_clips = sorted(clips, key=lambda c: c.timeline_start)
+        self._timeline_start_position = start_position
+        
+        # Find which clip contains the start position
+        self._current_clip_index = -1
+        for i, clip in enumerate(self._timeline_clips):
+            clip_end = clip.timeline_start + clip.duration
+            if clip.timeline_start <= start_position < clip_end:
+                self._current_clip_index = i
+                break
+            elif start_position < clip.timeline_start:
+                # Start position is in a gap before this clip
+                self._current_clip_index = i
+                gap_duration = clip.timeline_start - start_position
+                self._show_black_screen(gap_duration)
+                return
+        
+        if self._current_clip_index < 0:
+            # Start position is after all clips
+            self._current_clip_index = len(self._timeline_clips) - 1
+        
+        # Load and play the starting clip
+        start_clip = self._timeline_clips[self._current_clip_index]
+        offset_in_clip = start_position - start_clip.timeline_start
+        
+        self._load_and_play_clip(start_clip)
+        
+        # Seek to correct position within clip
+        if offset_in_clip > 0:
+            seek_pos = int((start_clip.start_time + offset_in_clip) * 1000) if hasattr(start_clip, 'start_time') else int(offset_in_clip * 1000)
+            self._media_player.setPosition(seek_pos)
+    
+    def stop_timeline_playback(self):
+        """Stop timeline playback and return to normal mode."""
+        self._timeline_mode = False
+        self._timeline_clips = []
+        self._current_clip_index = -1
+        
+        if self._gap_timer and self._gap_timer.isActive():
+            self._gap_timer.stop()
+        
+        self._black_screen.hide()
+        self._media_player.stop()
+        self._on_stop_clicked()
+    
+    def is_timeline_mode(self) -> bool:
+        """Check if currently in timeline playback mode."""
+        return self._timeline_mode
     
     def _on_media_position_changed(self, position_ms: int):
         """Handle media player position changes (position in milliseconds)."""
@@ -515,6 +681,9 @@ class PreviewWidget(QWidget):
             self.position_slider.blockSignals(False)
         
         self._update_time_display()
+        
+        # Emit position change for timeline sync
+        self.position_changed.emit(position)
     
     def _on_duration_changed(self, duration_ms: int):
         """Handle media player duration changes (duration in milliseconds)."""

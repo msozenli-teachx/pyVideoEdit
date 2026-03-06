@@ -49,6 +49,7 @@ class TimelineClip:
     timeline_start: float
     duration: float
     color: str = "#00bcd4"
+    file_path: str = ""  # Source file path for playback
 
 
 @dataclass
@@ -267,7 +268,8 @@ class EditorService(QObject):
             start_time=start_time,
             end_time=end_time,
             timeline_start=timeline_start,
-            duration=end_time - start_time
+            duration=end_time - start_time,
+            file_path=str(media.file_path)
         )
         
         self._timeline_clips.append(clip)
@@ -287,8 +289,66 @@ class EditorService(QObject):
         """Get all clips on the timeline."""
         return self._timeline_clips.copy()
     
+    def get_track_end_time(self, track_id: int = 0) -> float:
+        """Get the end time of the last clip on a track.
+        
+        Args:
+            track_id: The track ID to check
+            
+        Returns:
+            The end time in seconds of the last clip, or 0 if no clips
+        """
+        max_end = 0.0
+        for clip in self._timeline_clips:
+            end = clip.timeline_start + clip.duration
+            if end > max_end:
+                max_end = end
+        return max_end
+    
+    def add_clip_to_timeline_auto(self, media_id: str, start_time: float, end_time: float,
+                                  track_id: int = 0) -> Optional[TimelineClip]:
+        """Add a clip to the timeline, automatically positioning it after existing clips.
+        
+        Args:
+            media_id: ID of the media to clip
+            start_time: Start time in source media
+            end_time: End time in source media
+            track_id: Target track ID (used for future track-specific logic)
+            
+        Returns:
+            TimelineClip if successful
+        """
+        # Calculate the next available position
+        timeline_start = self.get_track_end_time(track_id)
+        
+        return self.add_clip_to_timeline(media_id, start_time, end_time, timeline_start)
+    
+    def get_track_clips(self, track_id: int = 0) -> List[TimelineClip]:
+        """Get all clips for a specific track.
+        
+        Note: Currently returns all clips as track-specific storage
+        is not yet implemented. Clips are sorted by timeline position.
+        
+        Args:
+            track_id: The track ID
+            
+        Returns:
+            List of clips on the track, sorted by timeline_start
+        """
+        # For now, return all clips sorted by position
+        # In the future, this would filter by track_id
+        return sorted(self._timeline_clips, key=lambda c: c.timeline_start)
+    
     def move_clip(self, clip_id: str, new_timeline_start: float) -> bool:
-        """Move a clip to a new position on the timeline."""
+        """Move a clip to a new position on the timeline.
+        
+        Args:
+            clip_id: ID of the clip to move
+            new_timeline_start: New start position on timeline in seconds
+            
+        Returns:
+            True if clip was moved successfully
+        """
         for clip in self._timeline_clips:
             if clip.clip_id == clip_id:
                 clip.timeline_start = new_timeline_start
