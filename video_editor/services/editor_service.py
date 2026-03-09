@@ -305,9 +305,50 @@ class EditorService(QObject):
                 max_end = end
         return max_end
     
+    def find_gap_for_clip(self, clip_duration: float, track_id: int = 0) -> Optional[float]:
+        """Find a gap that can fit a clip of the given duration.
+        
+        Searches for gaps between existing clips where the new clip would fit.
+        
+        Args:
+            clip_duration: Duration of the clip to place
+            track_id: Target track ID
+            
+        Returns:
+            Timeline start position for the clip, or None if no suitable gap found
+        """
+        if not self._timeline_clips:
+            return 0.0
+        
+        # Sort clips by timeline position
+        sorted_clips = sorted(self._timeline_clips, key=lambda c: c.timeline_start)
+        
+        # Check for gap at the beginning
+        first_clip = sorted_clips[0]
+        if first_clip.timeline_start >= clip_duration:
+            return 0.0
+        
+        # Check for gaps between clips
+        for i in range(len(sorted_clips) - 1):
+            current_clip = sorted_clips[i]
+            next_clip = sorted_clips[i + 1]
+            
+            gap_start = current_clip.timeline_start + current_clip.duration
+            gap_end = next_clip.timeline_start
+            gap_duration = gap_end - gap_start
+            
+            if gap_duration >= clip_duration:
+                return gap_start
+        
+        # No suitable gap found, place at end
+        return None
+    
     def add_clip_to_timeline_auto(self, media_id: str, start_time: float, end_time: float,
                                   track_id: int = 0) -> Optional[TimelineClip]:
-        """Add a clip to the timeline, automatically positioning it after existing clips.
+        """Add a clip to the timeline, automatically positioning it.
+        
+        First tries to find a gap that can fit the clip. If no gap is found,
+        places it at the end of the timeline.
         
         Args:
             media_id: ID of the media to clip
@@ -318,10 +359,18 @@ class EditorService(QObject):
         Returns:
             TimelineClip if successful
         """
-        # Calculate the next available position
-        timeline_start = self.get_track_end_time(track_id)
+        clip_duration = end_time - start_time
         
-        return self.add_clip_to_timeline(media_id, start_time, end_time, timeline_start)
+        # Try to find a gap that fits the clip
+        gap_position = self.find_gap_for_clip(clip_duration, track_id)
+        
+        if gap_position is not None:
+            # Found a gap, place clip there
+            return self.add_clip_to_timeline(media_id, start_time, end_time, gap_position)
+        else:
+            # No gap found, place at end
+            timeline_start = self.get_track_end_time(track_id)
+            return self.add_clip_to_timeline(media_id, start_time, end_time, timeline_start)
     
     def get_track_clips(self, track_id: int = 0) -> List[TimelineClip]:
         """Get all clips for a specific track.
@@ -585,6 +634,72 @@ class EditorService(QObject):
         # Placeholder for frame extraction
         # Would extract frame using FFmpeg and return QImage
         pass
+    
+    # Timeline Playback Operations
+    def get_timeline_duration(self) -> float:
+        """Get the total duration of the timeline.
+        
+        Returns:
+            Duration in seconds
+        """
+        if not self._timeline_clips:
+            return 0.0
+        
+        max_end = 0.0
+        for clip in self._timeline_clips:
+            end = clip.timeline_start + clip.duration
+            if end > max_end:
+                max_end = end
+        
+        return max_end
+    
+    def get_sorted_timeline_clips(self) -> List[TimelineClip]:
+        """Get timeline clips sorted by timeline_start position.
+        
+        Returns:
+            List of TimelineClip sorted by position
+        """
+        return sorted(self._timeline_clips, key=lambda c: c.timeline_start)
+    
+    def get_segment_at_position(self, position: float) -> Optional[dict]:
+        """Get the segment (clip or gap) at a timeline position.
+        
+        Args:
+            position: Timeline position in seconds
+            
+        Returns:
+            Dict with 'type' ('clip' or 'gap'), 'clip' (if applicable), 
+            and 'duration' (for gaps)
+        """
+        sorted_clips = self.get_sorted_timeline_clips()
+        
+        if not sorted_clips:
+            return None
+        
+        # Check for clip at position
+        for clip in sorted_clips:
+            clip_end = clip.timeline_start + clip.duration
+            if clip.timeline_start <= position < clip_end:
+                return {
+                    'type': 'clip',
+                    'clip': clip,
+                    'offset_in_clip': position - clip.timeline_start
+                }
+        
+        # Check for gap
+        current_time = 0.0
+        for clip in sorted_clips:
+            if position < clip.timeline_start:
+                # Position is in a gap before this clip
+                return {
+                    'type': 'gap',
+                    'duration': clip.timeline_start - position,
+                    'next_clip': clip
+                }
+            current_time = clip.timeline_start + clip.duration
+        
+        # Position is after all clips
+        return None
     
     def shutdown(self):
         """Shutdown the service and cleanup resources."""

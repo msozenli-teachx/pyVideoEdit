@@ -221,6 +221,9 @@ class TimelineTrack(QWidget):
             x = int(i * self._pixels_per_second)
             painter.drawLine(x, 0, x, self.height())
         
+        # Draw gap blocks (empty space between clips)
+        self._draw_gap_blocks(painter)
+        
         # Draw clips
         for clip in self.clips:
             self._draw_clip(painter, clip)
@@ -239,6 +242,58 @@ class TimelineTrack(QWidget):
             parent = parent.parent()
         
         painter.end()
+    
+    def _draw_gap_blocks(self, painter: QPainter):
+        """Draw gap blocks (empty space visualization) between clips."""
+        if not self.clips:
+            return
+        
+        # Sort clips by timeline start
+        sorted_clips = sorted(self.clips, key=lambda c: c.timeline_start)
+        
+        # Find gaps between clips
+        gaps = []
+        current_time = 0.0
+        
+        for clip in sorted_clips:
+            if clip.timeline_start > current_time + 0.001:  # Small tolerance
+                gap_duration = clip.timeline_start - current_time
+                gaps.append((current_time, clip.timeline_start, gap_duration))
+            current_time = clip.timeline_start + clip.duration
+        
+        # Draw each gap block
+        for gap_start, gap_end, gap_duration in gaps:
+            x = int(gap_start * self._pixels_per_second)
+            width = int(gap_duration * self._pixels_per_second)
+            
+            if width < 5:
+                continue  # Skip very small gaps
+            
+            margin = 3
+            rect = QRect(x, margin, width, self.height() - 2 * margin)
+            
+            # Draw gap background with faded color
+            gap_color = QColor(60, 60, 60, 180)  # Semi-transparent dark gray
+            brush = QBrush(gap_color)
+            painter.setBrush(brush)
+            
+            # Draw with dashed border
+            pen = QPen(QColor(100, 100, 100, 150))
+            pen.setWidth(1)
+            pen.setStyle(Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            
+            painter.drawRoundedRect(rect, 4, 4)
+            
+            # Draw gap label
+            painter.setPen(QColor(150, 150, 150))
+            font = QFont("Segoe UI", 8)
+            font.setItalic(True)
+            painter.setFont(font)
+            
+            text_rect = rect.adjusted(5, 5, -5, -5)
+            gap_text = f"Gap: {gap_duration:.1f}s"
+            painter.drawText(text_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, gap_text)
     
     def _draw_clip(self, painter: QPainter, clip: TimelineClip):
         """Draw a single clip."""
@@ -567,6 +622,22 @@ class TimelineWidget(QWidget):
         for track in self._tracks:
             track.clear()
     
+    def is_dragging_clip(self) -> bool:
+        """Check if any track is currently dragging a clip."""
+        for track in self._tracks:
+            if track._is_dragging_clip:
+                return True
+        return False
+
+    def get_dragging_clip_info(self) -> Optional[tuple]:
+        """Get info about the clip currently being dragged."""
+        for track in self._tracks:
+            if track._is_dragging_clip and track._drag_clip_id:
+                for clip in track.clips:
+                    if clip.clip_id == track._drag_clip_id:
+                        return clip, track.track_id
+        return None
+
     def set_playhead_position(self, position: float):
         """Set the playhead position."""
         self._playhead_position = max(0, position)
