@@ -44,12 +44,21 @@ class TimelineClip:
     clip_id: str
     media_id: str
     name: str
-    start_time: float  # Source start time
-    end_time: float    # Source end time
+    start_time: float  # Source start time (can be trimmed)
+    end_time: float    # Source end time (can be trimmed)
     timeline_start: float
     duration: float
     color: str = "#00bcd4"
     file_path: str = ""  # Source file path for playback
+    source_media_start: float = 0.0  # Original source media start (immutable)
+    source_media_end: float = 0.0    # Original source media end (immutable)
+    
+    def __post_init__(self):
+        """Initialize source media bounds if not set."""
+        if self.source_media_start == 0.0 and self.source_media_end == 0.0:
+            # First creation - set the original bounds
+            self.source_media_start = self.start_time
+            self.source_media_end = self.end_time
 
 
 @dataclass
@@ -269,7 +278,9 @@ class EditorService(QObject):
             end_time=end_time,
             timeline_start=timeline_start,
             duration=end_time - start_time,
-            file_path=str(media.file_path)
+            file_path=str(media.file_path),
+            source_media_start=start_time,
+            source_media_end=end_time
         )
         
         self._timeline_clips.append(clip)
@@ -404,6 +415,134 @@ class EditorService(QObject):
                 self.timeline_updated.emit()
                 return True
         return False
+
+    def get_clip_by_id(self, clip_id: str) -> Optional[TimelineClip]:
+        """Get a timeline clip by ID."""
+        for clip in self._timeline_clips:
+            if clip.clip_id == clip_id:
+                return clip
+        return None
+
+    def split_clip_at_position(self, clip_id: str, timeline_position: float) -> Optional[list[TimelineClip]]:
+        """Split a clip at the given timeline position.
+
+        Args:
+            clip_id: ID of the clip to split
+            timeline_position: Timeline position in seconds
+
+        Returns:
+            List of new clips [left_clip, right_clip] if split, otherwise None
+        """
+        clip = self.get_clip_by_id(clip_id)
+        if not clip:
+            return None
+
+        clip_start = clip.timeline_start
+        clip_end = clip.timeline_start + clip.duration
+
+        # Ensure split position is within clip bounds (not on edges)
+        if timeline_position <= clip_start + 0.01 or timeline_position >= clip_end - 0.01:
+            return None
+
+        # Calculate split point in source media
+        offset_in_clip = timeline_position - clip.timeline_start
+        split_source_time = clip.start_time + offset_in_clip
+
+        if split_source_time <= clip.start_time + 0.01 or split_source_time >= clip.end_time - 0.01:
+            return None
+
+        # Create left clip - inherits source bounds from original clip
+        left_clip = TimelineClip(
+            clip_id=str(uuid.uuid4())[:8],
+            media_id=clip.media_id,
+            name=f"{clip.name} [L]",
+            start_time=clip.start_time,
+            end_time=split_source_time,
+            timeline_start=clip.timeline_start,
+            duration=split_source_time - clip.start_time,
+            color=clip.color,
+            file_path=clip.file_path,
+            source_media_start=clip.source_media_start,
+            source_media_end=clip.source_media_end
+        )
+        self._update_clip_name(left_clip)
+
+        # Create right clip - inherits source bounds from original clip
+        right_clip = TimelineClip(
+            clip_id=str(uuid.uuid4())[:8],
+            media_id=clip.media_id,
+            name=f"{clip.name} [R]",
+            start_time=split_source_time,
+            end_time=clip.end_time,
+            timeline_start=timeline_position,
+            duration=clip.end_time - split_source_time,
+            color=clip.color,
+            file_path=clip.file_path,
+            source_media_start=clip.source_media_start,
+            source_media_end=clip.source_media_end
+        )
+        self._update_clip_name(right_clip)
+
+        # Replace the old clip with the new ones
+        self._timeline_clips = [c for c in self._timeline_clips if c.clip_id != clip_id]
+        self._timeline_clips.extend([left_clip, right_clip])
+        self.timeline_updated.emit()
+        return [left_clip, right_clip]
+
+    def trim_clip(self, clip_id: str, new_timeline_start: float, new_timeline_end: float) -> bool:
+        """Trim a clip by setting new timeline start/end positions.
+
+        Enforces that trimming cannot extend beyond the original source media bounds.
+
+        Args:
+            clip_id: ID of the clip to trim
+            new_timeline_start: New start position on the timeline
+            new_timeline_end: New end position on the timeline
+
+        Returns:
+            True if trimmed successfully
+        """
+        clip = self.get_clip_by_id(clip_id)
+        if not clip:
+            return False
+
+        min_duration = 0.1
+        if new_timeline_end - new_timeline_start < min_duration:
+            return False
+
+        # Calculate new source times based on timeline trim
+        left_trim_delta = new_timeline_start - clip.timeline_start
+        new_source_start = clip.start_time + left_trim_delta
+        new_source_end = clip.start_time + (new_timeline_end - clip.timeline_start)
+
+        # Enforce source media bounds - cannot extend beyond original source range
+        if new_source_start < clip.source_media_start:
+            new_source_start = clip.source_media_start
+            new_timeline_start = clip.timeline_start + (new_source_start - clip.start_time)
+
+        if new_source_end > clip.source_media_end:
+            new_source_end = clip.source_media_end
+            new_timeline_end = clip.timeline_start + (new_source_end - clip.start_time)
+
+        # Validate the result
+        if new_source_end <= new_source_start + min_duration:
+            return False
+
+        if new_timeline_end <= new_timeline_start + min_duration:
+            return False
+
+        clip.timeline_start = new_timeline_start
+        clip.start_time = new_source_start
+        clip.end_time = new_source_end
+        clip.duration = new_source_end - new_source_start
+        self._update_clip_name(clip)
+
+        self.timeline_updated.emit()
+        return True
+
+    def _update_clip_name(self, clip: TimelineClip):
+        """Update clip name to match current in/out times."""
+        clip.name = f"{clip.name.split(' [', 1)[0]} [{clip.start_time:.1f}s - {clip.end_time:.1f}s]"
     
     # Processing Operations
     def create_clip(self, media_id: str, start_time: float, end_time: float, 

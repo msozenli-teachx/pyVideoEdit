@@ -501,9 +501,16 @@ class PreviewWidget(QWidget):
             if self._timeline_playback_engine:
                 if self._timeline_playback_engine.state == PlaybackState.PLAYING:
                     self._timeline_playback_engine.pause()
+                    # Also pause media player and mute audio immediately
+                    self._media_player.pause()
+                    if self._audio_output:
+                        self._audio_output.setVolume(0.0)
                     self.pause_clicked.emit()
                 elif self._timeline_playback_engine.state == PlaybackState.PAUSED:
                     self._timeline_playback_engine.resume()
+                    # Restore audio volume on resume
+                    if self._audio_output:
+                        self._audio_output.setVolume(1.0)
                     self.play_clicked.emit()
                 else:
                     # STOPPED state - need to start playback
@@ -513,43 +520,62 @@ class PreviewWidget(QWidget):
                     else:
                         start_pos = 0
                     self._timeline_playback_engine.play(start_pos)
+                    # Restore audio volume on start
+                    if self._audio_output:
+                        self._audio_output.setVolume(1.0)
                     self.play_clicked.emit()
             return
-        
+
         # Single media playback mode
         if self._current_file_path is None:
             return
-        
+
         if self._is_playing:
             self._media_player.pause()
+            if self._audio_output:
+                self._audio_output.setVolume(0.0)
             self.pause_clicked.emit()
         else:
+            if self._audio_output:
+                self._audio_output.setVolume(1.0)
             self._media_player.play()
             self.play_clicked.emit()
     
     def _on_stop_clicked(self):
-        """Handle stop button click."""
-        # Stop the engine if in timeline mode
+        """Handle stop button click.
+
+        Stops video and audio immediately, clears all buffers, and resets the playhead
+        to the beginning of the timeline.
+        """
+        # Stop the engine if in timeline mode - this clears buffers and resets position
         if self._timeline_playback_engine:
             self._timeline_playback_engine.stop()
-        
+
         # Always stop the local media player and mute audio
         self._media_player.stop()
         self._media_player.pause()
+
         if self._audio_output:
             self._audio_output.setVolume(0.0)
-        
+
+        # Show black screen
+        self._black_screen.show()
+        self.video_widget.hide()
+
         self._timeline_mode = False
         self._is_playing = False
         self._current_position = 0.0
         self._update_play_button()
         self._update_time_display()
-        
+
         # Reset slider to beginning
         self.position_slider.blockSignals(True)
         self.position_slider.setValue(0)
         self.position_slider.blockSignals(False)
-        
+
+        # Update media label
+        self.media_label.setText("Stopped")
+
         self.stop_clicked.emit()
     
     def _on_slider_pressed(self):
@@ -613,21 +639,25 @@ class PreviewWidget(QWidget):
         logger.debug(f"Engine state changed to: {state.name}")
     
     def _on_timeline_position_changed(self, position: float):
-        """Handle timeline position changes from the engine."""
+        """Handle timeline position changes from the engine.
+
+        Updates the slider and time display to match the playhead position.
+        """
         if self._slider_is_dragging:
             return
-        
+
         self._current_position = position
-        
-        # Update slider
+
+        # Update slider to match playhead position
         if self._duration > 0:
             slider_value = int((position / self._duration) * 1000)
             self.position_slider.blockSignals(True)
             self.position_slider.setValue(slider_value)
             self.position_slider.blockSignals(False)
-        
+
+        # Update time display
         self._update_time_display()
-        
+
         # Always emit for external sync (timeline playhead)
         # The main window handles feedback loop prevention
         self.position_changed.emit(position)
@@ -749,14 +779,25 @@ class PreviewWidget(QWidget):
     
     def _display_gap_screen(self):
         """Display black screen for gap playback.
-        
-        This is a callback from the TimelinePlaybackEngine.
+
+        This is called when the playhead is in a gap between clips.
+        Shows black screen and ensures audio is silent.
         """
-        logger.debug("Displaying gap screen")
+        logger.debug("Displaying gap screen (black)")
+
+        # Pause media player to stop any playing video/audio
         self._media_player.pause()
+
+        # Hide video widget and show black screen
         self.video_widget.hide()
         self._black_screen.show()
-        self._audio_output.setVolume(0.0)
+
+        # Mute audio to ensure no sound
+        if self._audio_output:
+            self._audio_output.setVolume(0.0)
+
+        # Update media label
+        self.media_label.setText("Gap (black)")
     
     def start_timeline_playback(self, clips: List[TimelineClip], start_position: float = 0):
         """Start playing the timeline from a specific position.
@@ -792,17 +833,47 @@ class PreviewWidget(QWidget):
         self._timeline_playback_engine.play(start_position)
     
     def stop_timeline_playback(self):
-        """Stop timeline playback and return to normal mode."""
+        """Stop timeline playback and return to normal mode.
+
+        Stops video and audio, clears buffers, and resets the playhead to the beginning.
+        """
         if self._timeline_playback_engine:
             self._timeline_playback_engine.stop()
-        
+
+        # Stop and clear media player
+        self._media_player.stop()
+        self._media_player.pause()
+
+        # Clear media source to release buffers, then restore
+        from PyQt6.QtCore import QUrl
+        current_source = self._media_player.source()
+        self._media_player.setSource(QUrl())
+        if current_source:
+            self._media_player.setSource(current_source)
+            self._media_player.pause()
+
+        # Mute audio
+        if self._audio_output:
+            self._audio_output.setVolume(0.0)
+
+        # Reset state
         self._timeline_mode = False
         self._is_playing = False
-        self._black_screen.hide()
-        self._media_player.stop()
-        
+        self._current_position = 0.0
+
+        # Show black screen, hide video
+        self._black_screen.show()
+        self.video_widget.hide()
+
+        # Reset slider
+        self.position_slider.blockSignals(True)
+        self.position_slider.setValue(0)
+        self.position_slider.blockSignals(False)
+
         self._update_play_button()
-        logger.info("Timeline playback stopped")
+        self._update_time_display()
+
+        logger.info("Timeline playback stopped and reset")
     
     def set_timeline_clips(self, clips: List[TimelineClip]):
         """Set the timeline clips without starting playback.
@@ -831,7 +902,7 @@ class PreviewWidget(QWidget):
     
     def seek_timeline(self, position: float):
         """Seek to a position in the timeline.
-        
+
         Args:
             position: Timeline position in seconds
         """
@@ -840,6 +911,43 @@ class PreviewWidget(QWidget):
         elif self._current_file_path:
             # Single media mode
             self._media_player.setPosition(int(position * 1000))
+
+    def sync_to_playhead(self, position: float, is_in_gap: bool = False):
+        """Synchronize the preview to the current playhead position.
+
+        This is called when the playhead is moved manually to ensure the preview
+        shows the correct content (clip or gap).
+
+        Args:
+            position: Current playhead position in seconds
+            is_in_gap: True if the playhead is in a gap between clips
+        """
+        self._current_position = position
+
+        # Update slider
+        if self._duration > 0:
+            slider_value = int((position / self._duration) * 1000)
+            self.position_slider.blockSignals(True)
+            self.position_slider.setValue(slider_value)
+            self.position_slider.blockSignals(False)
+
+        # Update time display
+        self._update_time_display()
+
+        # Handle gap or clip display
+        if is_in_gap:
+            self._display_gap_screen()
+        else:
+            # Show video widget, hide black screen
+            self.video_widget.show()
+            self._black_screen.hide()
+
+            # Keep audio muted when not playing to prevent bleed
+            if self._audio_output:
+                if self._is_playing:
+                    self._audio_output.setVolume(1.0)
+                else:
+                    self._audio_output.setVolume(0.0)
     
     def is_timeline_mode(self) -> bool:
         """Check if currently in timeline playback mode."""

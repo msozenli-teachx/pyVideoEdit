@@ -23,6 +23,8 @@ class TimelineTrack(QWidget):
     # Signals
     media_dropped = pyqtSignal(str, str, float, float)  # media_id, name, duration, timeline_start
     clip_moved = pyqtSignal(str, float)  # clip_id, new_timeline_start
+    clip_trimmed = pyqtSignal(str, float, float)  # clip_id, new_timeline_start, new_timeline_end
+    split_requested = pyqtSignal(str)  # clip_id
     playhead_moved = pyqtSignal(float)   # new_position in seconds
     
     def __init__(self, track_id: int, name: str, height: int = 60, parent: Optional[QWidget] = None):
@@ -40,7 +42,11 @@ class TimelineTrack(QWidget):
         self._is_dragging_playhead = False
         self._drag_start_pos = None
         self._drag_clip_initial_start = 0
+        self._drag_clip_initial_duration = 0
+        self._drag_clip_source_start = 0.0
+        self._drag_clip_source_end = 0.0
         self._drag_clip_id = None
+        self._drag_mode = None  # move, trim_left, trim_right
         
         self.setFixedHeight(height)
         self.setMinimumWidth(1000)
@@ -63,17 +69,60 @@ class TimelineTrack(QWidget):
         playhead_x = self._get_playhead_x()
         return abs(x - playhead_x) < 8  # 8px tolerance for easier grabbing
 
+    def _get_clip_edge_at_position(self, x: float) -> tuple[Optional[str], str]:
+        """Check if position is near a clip edge and return clip_id and edge type.
+
+        Args:
+            x: X coordinate in pixels
+
+        Returns:
+            Tuple of (clip_id, edge_type) where edge_type is 'left', 'right', or 'none'
+        """
+        click_time = x / self._pixels_per_second
+        edge_tolerance = 6  # pixels
+
+        for clip in self.clips:
+            clip_start_time = clip.timeline_start
+            clip_end_time = clip.timeline_start + clip.duration
+
+            if clip_start_time <= click_time <= clip_end_time:
+                left_edge = clip_start_time * self._pixels_per_second
+                right_edge = clip_end_time * self._pixels_per_second
+
+                if abs(x - left_edge) <= edge_tolerance:
+                    return (clip.clip_id, 'left')
+                elif abs(x - right_edge) <= edge_tolerance:
+                    return (clip.clip_id, 'right')
+                else:
+                    return (clip.clip_id, 'none')
+
+        return (None, 'none')
+
     def mousePressEvent(self, event: QMouseEvent):
+        click_x = event.position().x()
+        click_time = click_x / self._pixels_per_second
+
+        if event.button() == Qt.MouseButton.RightButton:
+            # Right-click: show context menu for clip actions
+            for clip in self.clips:
+                if clip.timeline_start <= click_time <= clip.timeline_start + clip.duration:
+                    self._selected_clip_id = clip.clip_id
+                    self.update()
+                    menu = QMenu(self)
+                    split_action = QAction("Split at Playhead", self)
+                    split_action.triggered.connect(lambda _, cid=clip.clip_id: self.split_requested.emit(cid))
+                    menu.addAction(split_action)
+                    menu.exec(self.mapToGlobal(event.position().toPoint()))
+                    return
+            return
+
         if event.button() == Qt.MouseButton.LeftButton:
-            click_x = event.position().x()
-            click_time = click_x / self._pixels_per_second
-            
             # Check if we clicked on the playhead first (higher priority)
             if self._is_on_playhead(click_x):
                 self._is_dragging_playhead = True
                 self.playhead_moved.emit(max(0, click_time))
                 return
-            
+
             # Check if we clicked on a clip
             for clip in self.clips:
                 if clip.timeline_start <= click_time <= clip.timeline_start + clip.duration:
@@ -81,54 +130,161 @@ class TimelineTrack(QWidget):
                     self._drag_clip_id = clip.clip_id
                     self._drag_start_pos = event.position()
                     self._drag_clip_initial_start = clip.timeline_start
+                    self._drag_clip_initial_duration = clip.duration
+                    self._drag_clip_source_start = clip.start_time
+                    self._drag_clip_source_end = clip.end_time
                     self._selected_clip_id = clip.clip_id
+
+                    # Determine if trimming left/right edge
+                    left_edge = clip.timeline_start * self._pixels_per_second
+                    right_edge = (clip.timeline_start + clip.duration) * self._pixels_per_second
+                    edge_tolerance = 6
+                    if abs(click_x - left_edge) <= edge_tolerance:
+                        self._drag_mode = "trim_left"
+                    elif abs(click_x - right_edge) <= edge_tolerance:
+                        self._drag_mode = "trim_right"
+                    else:
+                        self._drag_mode = "move"
+
                     self.update()
                     return
-            
+
             # If not on clip or playhead, move playhead to clicked position
             self._is_dragging_playhead = True
             self.playhead_moved.emit(max(0, click_time))
 
+    def _get_trim_constraints(self, clip_id: str, drag_mode: str) -> tuple[float, float]:
+        """Get min/max constraints for trimming a clip to avoid overlapping.
+
+        Args:
+            clip_id: ID of the clip being trimmed
+            drag_mode: 'trim_left' or 'trim_right'
+
+        Returns:
+            Tuple of (min_bound, max_bound) in timeline time
+        """
+        target_clip = next(c for c in self.clips if c.clip_id == clip_id)
+        min_duration = 0.1
+
+        if drag_mode == "trim_left":
+            # Left trim: find the clip to the left
+            min_bound = 0.0
+            max_bound = target_clip.timeline_start + target_clip.duration - min_duration
+
+            for clip in self.clips:
+                if clip.clip_id == clip_id:
+                    continue
+                clip_end = clip.timeline_start + clip.duration
+                # If this clip ends where our target clip starts (or before)
+                if clip_end <= target_clip.timeline_start + 0.001:
+                    min_bound = max(min_bound, clip_end)
+
+            return (min_bound, max_bound)
+
+        else:  # trim_right
+            # Right trim: find the clip to the right
+            min_bound = target_clip.timeline_start + min_duration
+            max_bound = float('inf')
+
+            for clip in self.clips:
+                if clip.clip_id == clip_id:
+                    continue
+                # If this clip starts where our target clip ends (or after)
+                if clip.timeline_start >= target_clip.timeline_start + target_clip.duration - 0.001:
+                    max_bound = min(max_bound, clip.timeline_start)
+
+            return (min_bound, max_bound)
+
     def mouseMoveEvent(self, event: QMouseEvent):
-        if self._is_dragging_clip:
+        if self._is_dragging_clip and self._drag_clip_id:
+            target_clip = next(c for c in self.clips if c.clip_id == self._drag_clip_id)
             delta_x = event.position().x() - self._drag_start_pos.x()
             delta_time = delta_x / self._pixels_per_second
-            new_start = max(0, self._drag_clip_initial_start + delta_time)
-            
-            # Collision detection
-            target_clip = next(c for c in self.clips if c.clip_id == self._drag_clip_id)
-            
-            # Find bounds
-            min_start = 0
-            max_start = float('inf')
-            
-            for clip in self.clips:
-                if clip.clip_id == self._drag_clip_id:
-                    continue
-                
-                # If clip is to the left
-                if clip.timeline_start + clip.duration <= self._drag_clip_initial_start:
-                    min_start = max(min_start, clip.timeline_start + clip.duration)
-                # If clip is to the right
-                elif clip.timeline_start >= self._drag_clip_initial_start + target_clip.duration:
-                    max_start = min(max_start, clip.timeline_start - target_clip.duration)
-            
-            new_start = max(min_start, min(new_start, max_start))
-            
-            if new_start != target_clip.timeline_start:
+            min_duration = 0.1
+
+            if self._drag_mode == "trim_left":
+                # Get collision constraints
+                min_bound, max_bound = self._get_trim_constraints(self._drag_clip_id, "trim_left")
+
+                new_start = self._drag_clip_initial_start + delta_time
+                new_start = max(min_bound, min(new_start, max_bound))
+
                 target_clip.timeline_start = new_start
-                self.clip_moved.emit(self._drag_clip_id, new_start)
+                target_clip.start_time = self._drag_clip_source_start + (new_start - self._drag_clip_initial_start)
+                target_clip.end_time = self._drag_clip_source_end
+                target_clip.duration = max(min_duration, target_clip.end_time - target_clip.start_time)
                 self.update()
+            elif self._drag_mode == "trim_right":
+                # Get collision constraints
+                min_bound, max_bound = self._get_trim_constraints(self._drag_clip_id, "trim_right")
+
+                new_end = self._drag_clip_initial_start + self._drag_clip_initial_duration + delta_time
+                new_end = max(min_bound, min(new_end, max_bound))
+
+                target_clip.duration = max(min_duration, new_end - self._drag_clip_initial_start)
+                target_clip.end_time = target_clip.start_time + target_clip.duration
+                self.update()
+            else:
+                new_start = max(0, self._drag_clip_initial_start + delta_time)
+
+                # Collision detection
+                min_start = 0
+                max_start = float('inf')
+
+                for clip in self.clips:
+                    if clip.clip_id == self._drag_clip_id:
+                        continue
+
+                    # If clip is to the left
+                    if clip.timeline_start + clip.duration <= self._drag_clip_initial_start:
+                        min_start = max(min_start, clip.timeline_start + clip.duration)
+                    # If clip is to the right
+                    elif clip.timeline_start >= self._drag_clip_initial_start + target_clip.duration:
+                        max_start = min(max_start, clip.timeline_start - target_clip.duration)
+
+                new_start = max(min_start, min(new_start, max_start))
+
+                if new_start != target_clip.timeline_start:
+                    target_clip.timeline_start = new_start
+                    self.clip_moved.emit(self._drag_clip_id, new_start)
+                    self.update()
         elif self._is_dragging_playhead:
             # Drag playhead
             click_time = event.position().x() / self._pixels_per_second
             self.playhead_moved.emit(max(0, click_time))
+        else:
+            # Not dragging - update cursor based on hover position
+            hover_x = event.position().x()
+            clip_id, edge_type = self._get_clip_edge_at_position(hover_x)
+
+            if edge_type in ('left', 'right'):
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+            elif clip_id:
+                self.setCursor(Qt.CursorShape.OpenHandCursor)
+            else:
+                self.setCursor(Qt.CursorShape.ArrowCursor)
 
     def mouseReleaseEvent(self, event: QMouseEvent):
+        if self._is_dragging_clip and self._drag_clip_id:
+            target_clip = next((c for c in self.clips if c.clip_id == self._drag_clip_id), None)
+            if target_clip:
+                if self._drag_mode in ("trim_left", "trim_right"):
+                    new_start = target_clip.timeline_start
+                    new_end = target_clip.timeline_start + target_clip.duration
+                    self.clip_trimmed.emit(target_clip.clip_id, new_start, new_end)
+                elif self._drag_mode == "move":
+                    self.clip_moved.emit(target_clip.clip_id, target_clip.timeline_start)
+
         self._is_dragging_clip = False
         self._is_dragging_playhead = False
         self._drag_clip_id = None
-    
+        self._drag_mode = None
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def leaveEvent(self, event):
+        """Handle mouse leaving the widget."""
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+
     def dragEnterEvent(self, event: QDragEnterEvent):
         """Handle drag enter event."""
         if event.mimeData().hasText() or event.mimeData().hasFormat('application/x-media-item'):
@@ -428,12 +584,16 @@ class TimelineWidget(QWidget):
         clip_double_clicked: Emitted when a clip is double-clicked
         position_changed: Emitted when playhead position changes
         clip_added_to_track: Emitted when a clip is added to a track via drag-drop
+        clip_trimmed: Emitted when a clip is trimmed (clip_id, new_start, new_end)
+        split_requested: Emitted when split is requested for a clip
     """
     
     clip_selected = pyqtSignal(str)      # clip_id
     clip_double_clicked = pyqtSignal(str)  # clip_id
     position_changed = pyqtSignal(float)  # position in seconds
     clip_added_to_track = pyqtSignal(int, str, float, float)  # track_id, media_id, duration, timeline_start
+    clip_trimmed = pyqtSignal(str, float, float)  # clip_id, new_timeline_start, new_timeline_end
+    split_requested = pyqtSignal(str)
     
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -558,6 +718,8 @@ class TimelineWidget(QWidget):
         # Connect signals
         track.media_dropped.connect(self._on_media_dropped)
         track.clip_moved.connect(self._on_clip_moved)
+        track.clip_trimmed.connect(self._on_clip_trimmed)
+        track.split_requested.connect(self._on_split_requested)
         track.playhead_moved.connect(self.set_playhead_position)
         
         # Track header
@@ -599,6 +761,15 @@ class TimelineWidget(QWidget):
         self.clip_selected.emit(clip_id) # Reuse or create new signal if needed
         # We should also update the service but that's handled in main window or here
         # For now, just ensuring it stays in sync
+
+    def _on_clip_trimmed(self, clip_id: str, new_start: float, new_end: float):
+        """Handle clip trimmed signal from track."""
+        self._update_duration()
+        self.clip_trimmed.emit(clip_id, new_start, new_end)
+
+    def _on_split_requested(self, clip_id: str):
+        """Handle split request from track."""
+        self.split_requested.emit(clip_id)
     
     def _add_track(self):
         """Add a new track via button."""
@@ -610,6 +781,29 @@ class TimelineWidget(QWidget):
         if 0 <= track_id < len(self._tracks):
             self._tracks[track_id].add_clip(clip)
             self._update_duration()
+
+    def get_clip_track_id(self, clip_id: str) -> Optional[int]:
+        """Get the track ID that contains the clip."""
+        for track in self._tracks:
+            for clip in track.clips:
+                if clip.clip_id == clip_id:
+                    return track.track_id
+        return None
+
+    def replace_clip_with(self, track_id: int, clip_id: str, new_clips: List[TimelineClip]):
+        """Replace a clip with new clips on a track."""
+        if 0 <= track_id < len(self._tracks):
+            track = self._tracks[track_id]
+            track.remove_clip(clip_id)
+            for clip in new_clips:
+                track.add_clip(clip)
+            self._update_duration()
+            self.update()
+
+    def refresh_duration(self):
+        """Refresh timeline duration and redraw."""
+        self._update_duration()
+        self.update()
     
     def remove_clip(self, clip_id: str):
         """Remove a clip from any track."""
