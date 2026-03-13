@@ -6,15 +6,12 @@ transitions with optimized buffering.
 """
 
 from dataclasses import dataclass, field
-from typing import Optional, List, Callable, Dict, Any
+from typing import Optional, List, Callable
 from enum import Enum, auto
-from PyQt6.QtCore import QObject, pyqtSignal, QTimer, QThread, QMutex, QWaitCondition
+from PyQt6.QtCore import QObject, pyqtSignal, QTimer
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtWidgets import QWidget
-import threading
 import time
-from collections import deque
-import os
 
 from video_editor.services.editor_service import TimelineClip
 from video_editor.utils.logging_config import get_logger
@@ -35,47 +32,33 @@ class PlaybackState(Enum):
 class PlaybackSegment:
     """Represents a segment in the timeline (clip or gap)."""
     timeline_start: float
-    timeline_end: float
-    duration: float
     is_gap: bool = False
     clip: Optional[TimelineClip] = None
+    _gap_duration: float = field(default=0.0)  # For gap segments
+    _gap_end: float = field(default=0.0)  # For gap segments
+    
+    @property
+    def timeline_end(self) -> float:
+        """Dynamic timeline end - always reflects current clip duration if clip segment."""
+        if self.is_gap:
+            return self._gap_end
+        else:
+            # For clip segments, calculate from current clip duration (supports trim/split)
+            return self.clip.timeline_start + self.clip.duration if self.clip else self.timeline_start
+    
+    @property
+    def duration(self) -> float:
+        """Dynamic duration - always reflects current clip duration if clip segment."""
+        if self.is_gap:
+            return self._gap_duration
+        else:
+            # For clip segments, use current clip duration (supports trim/split)
+            return self.clip.duration if self.clip else 0.0
     
     def contains_position(self, position: float) -> bool:
         """Check if a timeline position falls within this segment."""
         # Use a small epsilon for floating point comparisons
         return self.timeline_start <= position + 1e-6 and position < self.timeline_end - 1e-6
-
-
-@dataclass
-class AudioBuffer:
-    """Audio buffer for smooth playback transitions."""
-    buffer_size: int = 3  # Number of segments to pre-buffer
-    segments: Dict[str, Any] = field(default_factory=dict)
-    ready_segments: deque = field(default_factory=deque)
-    lock: threading.Lock = field(default_factory=threading.Lock)
-    
-    def add_segment(self, segment_id: str, data: Any):
-        """Add a segment to the buffer."""
-        with self.lock:
-            self.segments[segment_id] = data
-            if segment_id not in self.ready_segments:
-                self.ready_segments.append(segment_id)
-    
-    def get_segment(self, segment_id: str) -> Optional[Any]:
-        """Get a segment from the buffer."""
-        with self.lock:
-            return self.segments.get(segment_id)
-    
-    def clear(self):
-        """Clear the buffer."""
-        with self.lock:
-            self.segments.clear()
-            self.ready_segments.clear()
-    
-    def is_ready(self, segment_id: str) -> bool:
-        """Check if a segment is buffered and ready."""
-        with self.lock:
-            return segment_id in self.segments
 
 
 class TimelinePlaybackEngine(QObject):
@@ -131,7 +114,6 @@ class TimelinePlaybackEngine(QObject):
         
         # Clip sync tracking
         self._last_loaded_clip_id: Optional[str] = None
-        self._clip_sync_pending: bool = False
         
         # Callbacks
         self._on_clip_load_callback: Optional[Callable] = None
@@ -154,8 +136,7 @@ class TimelinePlaybackEngine(QObject):
         self._video_widget = video_widget
         self._black_screen = black_screen
         
-        # Connect only to error signal - we don't use media player's position
-        # since we drive the playhead with our own timer
+        # Connect only to error signal - we use the global timer for clip boundary enforcement
         if self._media_player:
             self._media_player.errorOccurred.connect(self._on_media_error)
     
@@ -179,6 +160,14 @@ class TimelinePlaybackEngine(QObject):
         self._clips = sorted(clips, key=lambda c: c.timeline_start)
         self._build_segments()
         self._calculate_duration()
+        
+        # CRITICAL: Reset segment tracking when clips change
+        # This is crucial when trim/split happens during playback
+        # Otherwise _current_segment points to stale segment data with old boundaries
+        self._current_segment_index = -1
+        self._current_segment = None
+        self._last_loaded_clip_id = None
+        
         logger.info(f"Timeline set with {len(self._clips)} clips, {len(self._segments)} segments, duration: {self._duration:.2f}s")
     
     def _build_segments(self):
@@ -196,9 +185,10 @@ class TimelinePlaybackEngine(QObject):
                 gap_duration = clip.timeline_start - current_time
                 gap_segment = PlaybackSegment(
                     timeline_start=current_time,
-                    timeline_end=clip.timeline_start,
-                    duration=gap_duration,
-                    is_gap=True
+                    is_gap=True,
+                    clip=None,
+                    _gap_duration=gap_duration,
+                    _gap_end=clip.timeline_start
                 )
                 self._segments.append(gap_segment)
                 logger.debug(f"Gap segment: {current_time:.2f}s - {clip.timeline_start:.2f}s ({gap_duration:.2f}s)")
@@ -206,8 +196,6 @@ class TimelinePlaybackEngine(QObject):
             # Add clip segment
             clip_segment = PlaybackSegment(
                 timeline_start=clip.timeline_start,
-                timeline_end=clip.timeline_start + clip.duration,
-                duration=clip.duration,
                 is_gap=False,
                 clip=clip
             )
@@ -369,13 +357,6 @@ class TimelinePlaybackEngine(QObject):
         self._current_segment_index = -1
         self._current_segment = None
         self._last_loaded_clip_id = None
-        self._clip_sync_pending = False
-
-        # Show black screen
-        if self._video_widget:
-            self._video_widget.hide()
-        if self._black_screen:
-            self._black_screen.show()
 
         self.position_changed.emit(self._position)
         logger.info("Playback stopped, buffers cleared, and playhead reset to start")
@@ -433,14 +414,21 @@ class TimelinePlaybackEngine(QObject):
 
         # Determine if we're in a gap so we can force gap display immediately
         segment = self.get_segment_at_position(position)
+
+        # Stop media player when manually moving playhead to prevent audio/video bleed
+        self._stop_media_player()
+
         if segment is None or segment.is_gap:
+            # We're in a gap - show black screen and silence
             self._current_segment_index = -1
-            self._current_segment = segment
+            self._current_segment = segment if segment else None
+            self._last_loaded_clip_id = None  # Force reload when entering clip
             self._display_gap_state()
         else:
-            # Force segment update to ensure media is synced immediately
+            # We're in a clip - force segment update to ensure media is synced immediately
             self._current_segment_index = -1
             self._current_segment = None
+            self._last_loaded_clip_id = None  # Force reload for clean start
             self._update_current_segment()
 
         # Preserve playback state
@@ -448,11 +436,6 @@ class TimelinePlaybackEngine(QObject):
             self._set_state(PlaybackState.PLAYING)
         else:
             self._set_state(PlaybackState.PAUSED)
-            # Ensure media player is paused when manually scrubbing
-            if self._media_player:
-                self._media_player.pause()
-            if self._audio_output:
-                self._audio_output.setVolume(0.0)
 
         self.position_changed.emit(position)
         logger.info(f"Manual playhead move to {position:.2f}s")
@@ -465,13 +448,8 @@ class TimelinePlaybackEngine(QObject):
         if self._black_screen:
             self._black_screen.show()
 
-        # Mute audio
-        if self._audio_output:
-            self._audio_output.setVolume(0.0)
-
-        # Pause media player
-        if self._media_player:
-            self._media_player.pause()
+        # Stop media player and mute audio to ensure no video/audio continues
+        self._stop_media_player()
 
         # Reset last loaded clip to force reload when entering a clip
         self._last_loaded_clip_id = None
@@ -499,6 +477,25 @@ class TimelinePlaybackEngine(QObject):
             self._on_timeline_finished()
             return
         
+        # CRITICAL FIX: Check if we're in a clip and have exceeded its trimmed end time
+        # This must happen BEFORE _update_current_segment to catch boundary violations early
+        if self._current_segment and not self._current_segment.is_gap:
+            segment_end = self._current_segment.timeline_end
+            if self._position >= segment_end:
+                # We've reached the end of this clip - stop media player immediately!
+                logger.debug(f"TIMER ENFORCEMENT: Position {self._position:.3f}s >= segment end {segment_end:.3f}s")
+                self._position = segment_end
+                # Stop media player immediately
+                if self._media_player:
+                    self._media_player.pause()
+                if self._audio_output:
+                    self._audio_output.setVolume(0.0)
+                # Transition to next segment
+                self._transition_to_next_segment()
+                # Emit position change
+                self.position_changed.emit(self._position)
+                return
+        
         # Update current segment and sync media player
         self._update_current_segment()
         
@@ -518,6 +515,15 @@ class TimelinePlaybackEngine(QObject):
                 # End of timeline or invalid position
                 if self._position >= self._duration - 0.01:
                     self._on_timeline_finished()
+                else:
+                    # Trim/split can temporarily create a timeline range with no explicit segment
+                    # (for example during interactive edits). Treat it as an implicit gap.
+                    logger.debug(
+                        f"No segment at position {self._position:.3f}s; handling as implicit gap"
+                    )
+                    self._current_segment_index = -1
+                    self._current_segment = None
+                    self._display_gap_state()
                 return
         
         # Check if segment changed
@@ -527,12 +533,12 @@ class TimelinePlaybackEngine(QObject):
         if segment_changed:
             logger.debug(f"Segment changed from {self._current_segment_index} to {segment_index}")
             self._current_segment_index = segment_index
-            self._current_segment = segment
         
         # Handle segment type
         if segment.is_gap:
-            self._handle_gap_segment(segment)
+            self._handle_gap_segment(segment, segment_changed)
         else:
+            self._current_segment = segment
             self._handle_clip_segment(segment, segment_changed)
 
         # Ensure audio volume matches current state after segment updates
@@ -542,30 +548,41 @@ class TimelinePlaybackEngine(QObject):
             else:
                 self._audio_output.setVolume(0.0)
     
-    def _handle_gap_segment(self, segment: PlaybackSegment):
-        """Handle being in a gap segment."""
+    def _handle_gap_segment(self, segment: PlaybackSegment, segment_changed: bool = False):
+        """Handle being in a gap segment.
+
+        When in a gap:
+        - Show black screen
+        - Mute audio
+        - Stop the media player to prevent any video/audio from continuing
+        - Reset the last loaded clip to force reload when entering next clip
+        """
+        # Check if we're entering a new gap (for signal emission)
+        entering_new_gap = segment_changed or (self._current_segment != segment)
+
+        # Update current segment tracking
+        self._current_segment = segment
+
         # Show black screen
         if self._video_widget:
             self._video_widget.hide()
         if self._black_screen:
             self._black_screen.show()
-        
-        # Always mute audio during gaps
-        if self._audio_output:
-            self._audio_output.setVolume(0.0)
-        
-        # Pause media player during gaps
-        if self._media_player:
-            from PyQt6.QtMultimedia import QMediaPlayer
-            if self._media_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
-                self._media_player.pause()
-        
+
+        # Stop media player and mute audio during gaps
+        # This ensures no video or audio continues playing from previous clip
+        self._stop_media_player()
+
+        # Reset clip tracking to force reload when entering next clip
+        # This ensures proper sync when transitioning from gap to clip
+        self._last_loaded_clip_id = None
+
         # Emit signals only when entering a new gap
-        if self._current_segment != segment:
+        if entering_new_gap:
             remaining = segment.timeline_end - self._position
             self.gap_started.emit(remaining)
             self.clip_changed.emit(None)
-            
+
             if self._on_gap_display_callback:
                 self._on_gap_display_callback()
     
@@ -587,9 +604,20 @@ class TimelinePlaybackEngine(QObject):
         offset_in_clip = self._position - segment.timeline_start
         source_position = clip.start_time + offset_in_clip
 
-        # Clamp source position to clip bounds to prevent reading beyond clip end
+        # Calculate the maximum source position for this clip (respecting trim/split boundaries)
         max_source_pos = clip.end_time - 0.01  # Small buffer to avoid reading exactly at end
+
+        # Check if we're approaching or have reached the end of the clip
+        # This is critical for trimmed/split clips to stop at the correct point
         if source_position >= max_source_pos:
+            # We've reached the end of this clip - transition to next segment
+            logger.debug(f"Clip {clip.name} reached end at source position {source_position:.2f}s")
+            self._position = segment.timeline_end  # Snap to segment end
+            self._transition_to_next_segment()
+            return
+
+        # Clamp source position to clip bounds to prevent reading beyond clip end
+        if source_position > max_source_pos:
             source_position = max_source_pos
 
         # Check if we need to load the clip
@@ -625,11 +653,18 @@ class TimelinePlaybackEngine(QObject):
                 self._audio_output.setVolume(0.0)
 
     def _transition_to_next_segment(self):
-        """Transition from current clip to the next segment (gap or next clip)."""
+        """Transition from current clip to the next segment (gap or next clip).
+
+        Ensures clean transitions by stopping media player when leaving a clip
+        and properly initializing the next segment.
+        """
         if self._current_segment_index < 0 or self._current_segment_index >= len(self._segments) - 1:
             # No more segments - we're at the end
             self._on_timeline_finished()
             return
+
+        # Get current segment before transitioning
+        current_segment = self._current_segment
 
         # Move to next segment
         next_index = self._current_segment_index + 1
@@ -637,16 +672,22 @@ class TimelinePlaybackEngine(QObject):
 
         logger.debug(f"Transitioning from segment {self._current_segment_index} to {next_index}")
 
+        # If we're leaving a clip, stop the media player to prevent audio/video bleed
+        if current_segment and not current_segment.is_gap:
+            self._stop_media_player()
+
         self._current_segment_index = next_index
-        self._current_segment = next_segment
 
         # Position at the start of the next segment
         self._position = next_segment.timeline_start
 
         # Handle the new segment
         if next_segment.is_gap:
-            self._handle_gap_segment(next_segment)
+            self._handle_gap_segment(next_segment, True)
         else:
+            # Force segment reload for clean clip start
+            self._current_segment = next_segment
+            self._last_loaded_clip_id = None
             self._handle_clip_segment(next_segment, True)
 
         self.position_changed.emit(self._position)
@@ -655,21 +696,21 @@ class TimelinePlaybackEngine(QObject):
         """Sync the media player to the given source position."""
         if not self._media_player:
             return
-        
+
         # Get current media player position
         current_media_pos = self._media_player.position() / 1000.0
-        
+
         # Calculate the difference
         diff = abs(current_media_pos - source_position)
-        
+
         # Always sync if difference is significant (> 0.05 seconds for better responsiveness)
         if diff > 0.05:
             logger.debug(f"Syncing media player: {current_media_pos:.2f}s -> {source_position:.2f}s")
             self._media_player.setPosition(int(source_position * 1000))
-        
+
         # Handle media player state based on our state
         from PyQt6.QtMultimedia import QMediaPlayer
-        
+
         if self._state == PlaybackState.PLAYING:
             # Ensure media player is playing
             if self._media_player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
@@ -682,31 +723,52 @@ class TimelinePlaybackEngine(QObject):
             # Ensure media player is stopped
             if self._media_player.playbackState() != QMediaPlayer.PlaybackState.StoppedState:
                 self._media_player.stop()
+
+    def _stop_media_player(self):
+        """Stop the media player and clear any buffered content.
+        
+        Uses pause() instead of stop() for better responsiveness, but ensures
+        volume is muted to prevent audio bleed.
+        """
+        if not self._media_player:
+            return
+
+        # Pause instead of stop to keep buffers ready but stop playback
+        self._media_player.pause()
+
+        # Mute audio output
+        if self._audio_output:
+            self._audio_output.setVolume(0.0)
     
     def _on_timeline_finished(self):
         """Called when playback reaches the end of the timeline."""
         logger.info("Timeline playback finished")
-        
+
         # Stop the master timer
         self._master_timer.stop()
-        
-        # Stop media player
+
+        # Stop media player completely
         if self._media_player:
             self._media_player.stop()
-        
+
+        # Mute audio
+        if self._audio_output:
+            self._audio_output.setVolume(0.0)
+
         # Update state
         self._set_state(PlaybackState.STOPPED)
-        
+
         # Show black screen
         if self._video_widget:
             self._video_widget.hide()
         if self._black_screen:
             self._black_screen.show()
-        
-        # Mute audio
-        if self._audio_output:
-            self._audio_output.setVolume(0.0)
-        
+
+        # Reset tracking
+        self._last_loaded_clip_id = None
+        self._current_segment = None
+        self._current_segment_index = -1
+
         # Emit finished signal
         self.playback_finished.emit()
     

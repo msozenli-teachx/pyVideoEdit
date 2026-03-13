@@ -6,15 +6,67 @@ Supports drag and drop from media pool.
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QScrollArea, QFrame, QSizePolicy, QMenu, QFileDialog,
-    QAbstractItemView
+    QScrollArea, QMenu
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QRect, QPoint, QSize, QPointF
-from PyQt6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QAction, QMouseEvent, QPaintEvent, QDragEnterEvent, QDropEvent, QPolygonF
-from typing import Optional, List, Dict
+from PyQt6.QtCore import Qt, pyqtSignal, QRect, QPointF, QSize
+from PyQt6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QAction, QMouseEvent, QPaintEvent, QDragEnterEvent, QDropEvent, QPolygonF, QIcon, QPixmap
+from typing import Optional, List
 import json
 
 from video_editor.services.editor_service import TimelineClip
+
+
+def _create_split_icon() -> QIcon:
+    """Create a simple split/scissors icon without external assets."""
+    pixmap = QPixmap(12, 12)
+    pixmap.fill(Qt.GlobalColor.transparent)
+
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+    pen = QPen(QColor("#ffffff"))
+    pen.setWidth(1)
+    painter.setPen(pen)
+
+    # Handles (centered)
+    painter.drawEllipse(1, 1, 3, 3)
+    painter.drawEllipse(1, 8, 3, 3)
+
+    # Blades (centered)
+    painter.drawLine(4, 3, 11, 1)
+    painter.drawLine(4, 8, 11, 11)
+
+    painter.end()
+    return QIcon(pixmap)
+
+
+def _create_minus_icon() -> QIcon:
+    """Create a compact minus icon that remains visible across styles."""
+    pixmap = QPixmap(12, 12)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pen = QPen(QColor("#ffffff"))
+    pen.setWidth(2)
+    painter.setPen(pen)
+    painter.drawLine(2, 6, 10, 6)
+    painter.end()
+    return QIcon(pixmap)
+
+
+def _create_plus_icon() -> QIcon:
+    """Create a compact plus icon that remains visible across styles."""
+    pixmap = QPixmap(12, 12)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pen = QPen(QColor("#ffffff"))
+    pen.setWidth(2)
+    painter.setPen(pen)
+    painter.drawLine(2, 6, 10, 6)
+    painter.drawLine(6, 2, 6, 10)
+    painter.end()
+    return QIcon(pixmap)
 
 
 class TimelineTrack(QWidget):
@@ -593,6 +645,7 @@ class TimelineWidget(QWidget):
     position_changed = pyqtSignal(float)  # position in seconds
     clip_added_to_track = pyqtSignal(int, str, float, float)  # track_id, media_id, duration, timeline_start
     clip_trimmed = pyqtSignal(str, float, float)  # clip_id, new_timeline_start, new_timeline_end
+    clip_moved = pyqtSignal(str, float)  # clip_id, new_timeline_start
     split_requested = pyqtSignal(str)
     
     def __init__(self, parent: Optional[QWidget] = None):
@@ -618,16 +671,31 @@ class TimelineWidget(QWidget):
         header_widget.setStyleSheet("background-color: #2d2d2d;")
         header_layout = QHBoxLayout(header_widget)
         header_layout.setContentsMargins(10, 0, 10, 0)
+        header_layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         
         self.ruler_label = QLabel("Timeline")
         self.ruler_label.setObjectName("sectionHeader")
         header_layout.addWidget(self.ruler_label)
+
+        split_btn = QPushButton()
+        split_btn.setToolTip("Split selected clip at playhead")
+        split_btn.setFixedSize(24, 22)
+        split_btn.setIcon(_create_split_icon())
+        split_btn.setIconSize(QSize(12, 12))
+        split_btn.setStyleSheet("background-color: #3a3a3a; border: 1px solid #555555; padding: 0px;")
+        split_btn.clicked.connect(self._request_split_from_toolbar)
+        header_layout.addWidget(split_btn)
         
         header_layout.addStretch()
         
         # Zoom controls
-        zoom_out_btn = QPushButton("-")
-        zoom_out_btn.setFixedSize(25, 25)
+        zoom_out_btn = QPushButton()
+        zoom_out_btn.setFixedSize(24, 22)
+        zoom_out_btn.setIcon(_create_minus_icon())
+        zoom_out_btn.setIconSize(QSize(12, 12))
+        zoom_out_btn.setStyleSheet(
+            "background-color: #3a3a3a; border: 1px solid #555555; padding: 0px;"
+        )
         zoom_out_btn.setToolTip("Zoom out")
         zoom_out_btn.clicked.connect(self._zoom_out)
         header_layout.addWidget(zoom_out_btn)
@@ -636,8 +704,13 @@ class TimelineWidget(QWidget):
         self.zoom_label.setObjectName("timeLabel")
         header_layout.addWidget(self.zoom_label)
         
-        zoom_in_btn = QPushButton("+")
-        zoom_in_btn.setFixedSize(25, 25)
+        zoom_in_btn = QPushButton()
+        zoom_in_btn.setFixedSize(24, 22)
+        zoom_in_btn.setIcon(_create_plus_icon())
+        zoom_in_btn.setIconSize(QSize(12, 12))
+        zoom_in_btn.setStyleSheet(
+            "background-color: #3a3a3a; border: 1px solid #555555; padding: 0px;"
+        )
         zoom_in_btn.setToolTip("Zoom in")
         zoom_in_btn.clicked.connect(self._zoom_in)
         header_layout.addWidget(zoom_in_btn)
@@ -691,8 +764,7 @@ class TimelineWidget(QWidget):
         time_layout.addWidget(self.time_label)
         
         time_layout.addStretch()
-        
-        # Add track button
+
         add_track_btn = QPushButton("+ Add Track")
         add_track_btn.clicked.connect(self._add_track)
         time_layout.addWidget(add_track_btn)
@@ -757,10 +829,31 @@ class TimelineWidget(QWidget):
         """Handle clip moved signal from track."""
         # Update project duration if needed
         self._update_duration()
-        # Trigger global timeline update signal so main window knows
-        self.clip_selected.emit(clip_id) # Reuse or create new signal if needed
-        # We should also update the service but that's handled in main window or here
-        # For now, just ensuring it stays in sync
+        self.clip_moved.emit(clip_id, new_timeline_start)
+
+    def _request_split_from_toolbar(self):
+        """Request split for selected clip or clip under playhead."""
+        clip_id = self._get_selected_clip_id()
+        if not clip_id:
+            clip_id = self._get_clip_at_playhead()
+        if clip_id:
+            self.split_requested.emit(clip_id)
+
+    def _get_selected_clip_id(self) -> Optional[str]:
+        """Get selected clip id from tracks."""
+        for track in self._tracks:
+            if track._selected_clip_id:
+                return track._selected_clip_id
+        return None
+
+    def _get_clip_at_playhead(self) -> Optional[str]:
+        """Get first clip id under playhead."""
+        pos = self._playhead_position
+        for track in self._tracks:
+            for clip in track.clips:
+                if clip.timeline_start <= pos <= clip.timeline_start + clip.duration:
+                    return clip.clip_id
+        return None
 
     def _on_clip_trimmed(self, clip_id: str, new_start: float, new_end: float):
         """Handle clip trimmed signal from track."""

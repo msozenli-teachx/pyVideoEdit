@@ -52,6 +52,7 @@ class TimelineClip:
     file_path: str = ""  # Source file path for playback
     source_media_start: float = 0.0  # Original source media start (immutable)
     source_media_end: float = 0.0    # Original source media end (immutable)
+    track_id: int = 0
     
     def __post_init__(self):
         """Initialize source media bounds if not set."""
@@ -253,8 +254,8 @@ class EditorService(QObject):
         )
     
     # Timeline Operations
-    def add_clip_to_timeline(self, media_id: str, start_time: float, end_time: float, 
-                             timeline_start: float = 0) -> Optional[TimelineClip]:
+    def add_clip_to_timeline(self, media_id: str, start_time: float, end_time: float,
+                             timeline_start: float = 0, track_id: int = 0) -> Optional[TimelineClip]:
         """Add a clip to the timeline.
         
         Args:
@@ -280,7 +281,8 @@ class EditorService(QObject):
             duration=end_time - start_time,
             file_path=str(media.file_path),
             source_media_start=start_time,
-            source_media_end=end_time
+            source_media_end=end_time,
+            track_id=track_id
         )
         
         self._timeline_clips.append(clip)
@@ -377,11 +379,11 @@ class EditorService(QObject):
         
         if gap_position is not None:
             # Found a gap, place clip there
-            return self.add_clip_to_timeline(media_id, start_time, end_time, gap_position)
+            return self.add_clip_to_timeline(media_id, start_time, end_time, gap_position, track_id)
         else:
             # No gap found, place at end
             timeline_start = self.get_track_end_time(track_id)
-            return self.add_clip_to_timeline(media_id, start_time, end_time, timeline_start)
+            return self.add_clip_to_timeline(media_id, start_time, end_time, timeline_start, track_id)
     
     def get_track_clips(self, track_id: int = 0) -> List[TimelineClip]:
         """Get all clips for a specific track.

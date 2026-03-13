@@ -7,14 +7,13 @@ Integrates with TimelinePlaybackEngine for master timeline playback.
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QSlider, QFrame, QFileDialog, QSizePolicy, QLineEdit, QGroupBox
+    QSlider, QFrame, QSizePolicy, QLineEdit, QGroupBox
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QSize, QTimer, QUrl
-from PyQt6.QtGui import QImage, QPixmap, QColor
-from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QUrl
+from PyQt6.QtGui import QImage, QPixmap
+from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoFrame
 from PyQt6.QtMultimediaWidgets import QVideoWidget
-from typing import Optional, List, Callable
-from pathlib import Path
+from typing import Optional, List
 import os
 
 from video_editor.core.timeline_playback import TimelinePlaybackEngine, PlaybackState
@@ -389,6 +388,23 @@ class PreviewWidget(QWidget):
             self.position_slider.blockSignals(False)
         
         self._update_time_display()
+
+    def set_timeline_total_duration(self, duration: float):
+        """Force preview total duration to timeline total (used during manual scrubbing)."""
+        if duration <= 0:
+            return
+
+        self._duration = duration
+        if self._current_position > self._duration:
+            self._current_position = self._duration
+
+        if self._duration > 0:
+            slider_value = int((self._current_position / self._duration) * 1000)
+            self.position_slider.blockSignals(True)
+            self.position_slider.setValue(slider_value)
+            self.position_slider.blockSignals(False)
+
+        self._update_time_display()
     
     def set_frame(self, image: QImage):
         """Display a video frame.
@@ -674,7 +690,7 @@ class PreviewWidget(QWidget):
     def _on_gap_started(self, duration: float):
         """Handle gap playback start."""
         logger.debug(f"Gap started, duration: {duration:.2f}s")
-        self.media_label.setText("Gap (black)")
+        # Gap display is already handled by engine callback to avoid duplicate stop calls.
     
     def _on_gap_ended(self):
         """Handle gap playback end."""
@@ -728,13 +744,80 @@ class PreviewWidget(QWidget):
             return
         
         self._current_file_path = str(media_path)
+
+        # Keep black screen until the new clip/frame is prepared to avoid old-frame flash.
+        self.video_widget.hide()
+        self._black_screen.show()
+
+        def _is_engine_playing() -> bool:
+            return bool(
+                self._timeline_playback_engine
+                and self._timeline_playback_engine.state == PlaybackState.PLAYING
+            )
+
+        def _activate_clip_view(is_playing_now: bool):
+            self._black_screen.hide()
+            self.video_widget.show()
+            if self._audio_output:
+                self._audio_output.setVolume(1.0 if is_playing_now else 0.0)
+
+        def _reveal_after_seek(target_ms: int, is_playing_now: bool):
+            """Reveal video only after seek settles to avoid stale-frame flash."""
+            done = False
+            reached_target = False
+            sink = self.video_widget.videoSink() if hasattr(self.video_widget, "videoSink") else None
+
+            def _finish():
+                nonlocal done
+                if done:
+                    return
+                done = True
+                try:
+                    self._media_player.positionChanged.disconnect(_on_position_changed)
+                except Exception:
+                    pass
+                if sink is not None:
+                    try:
+                        sink.videoFrameChanged.disconnect(_on_video_frame_changed)
+                    except Exception:
+                        pass
+                _activate_clip_view(is_playing_now)
+
+            def _on_video_frame_changed(frame):
+                # Only reveal after seek target is reached and a fresh frame arrives.
+                if done or not reached_target:
+                    return
+                if self._media_player.source() != new_source:
+                    return
+                try:
+                    if frame is None or not frame.isValid():
+                        return
+                except Exception:
+                    pass
+                _finish()
+
+            def _on_position_changed(pos_ms: int):
+                nonlocal reached_target
+                # Reveal once we're at/near target frame for the current source.
+                if done:
+                    return
+                if self._media_player.source() != new_source:
+                    return
+                if pos_ms >= max(0, target_ms - 120):
+                    reached_target = True
+                    if sink is None:
+                        _finish()
+
+            self._media_player.positionChanged.connect(_on_position_changed)
+            if sink is not None:
+                sink.videoFrameChanged.connect(_on_video_frame_changed)
+
+            # Short fallback to keep transitions snappy if backend signals are delayed.
+            QTimer.singleShot(90, _finish)
         
         # Check if we need to load a new source or just seek
         current_source = self._media_player.source()
         new_source = QUrl.fromLocalFile(self._current_file_path)
-        
-        is_playing = (self._timeline_playback_engine and 
-                      self._timeline_playback_engine.state == PlaybackState.PLAYING)
         
         if current_source != new_source:
             # Need to load new source
@@ -745,33 +828,57 @@ class PreviewWidget(QWidget):
             # Use a lambda to seek and play once the media is ready
             def on_media_status_changed(status):
                 from PyQt6.QtMultimedia import QMediaPlayer
-                if status == QMediaPlayer.MediaStatus.LoadedMedia:
+                if status in (
+                    QMediaPlayer.MediaStatus.LoadedMedia,
+                    QMediaPlayer.MediaStatus.BufferedMedia,
+                ):
                     self._media_player.mediaStatusChanged.disconnect(on_media_status_changed)
                     # Seek to the source position
                     seek_ms = int(source_position * 1000)
                     self._media_player.setPosition(seek_ms)
-                    
+
                     # Start playback only if engine is in PLAYING state
-                    if is_playing:
+                    playing_now = _is_engine_playing()
+                    if playing_now:
                         self._media_player.play()
                     else:
                         # Ensure paused state
                         self._media_player.pause()
-                    logger.debug(f"Media loaded, seeked to {source_position:.2f}s, playing={is_playing}")
+                    _reveal_after_seek(seek_ms, playing_now)
+                    logger.debug(f"Media loaded, seeked to {source_position:.2f}s, playing={playing_now}")
             
             self._media_player.mediaStatusChanged.connect(on_media_status_changed)
+
+            # Fallback: if readiness signal ordering is odd on some backends,
+            # enforce seek/play shortly after source assignment.
+            def _enforce_clip_start():
+                if self._media_player.source() != new_source:
+                    return
+                seek_ms = int(source_position * 1000)
+                self._media_player.setPosition(seek_ms)
+                playing_now = _is_engine_playing()
+                if playing_now:
+                    self._media_player.play()
+                else:
+                    self._media_player.pause()
+                _reveal_after_seek(seek_ms, playing_now)
+
+            QTimer.singleShot(150, _enforce_clip_start)
         else:
             # Same source, just seek
             logger.debug(f"Same source, seeking to {source_position:.2f}s")
             seek_ms = int(source_position * 1000)
             self._media_player.setPosition(seek_ms)
-            
+
             # Start playback only if engine is in PLAYING state
-            if is_playing:
+            playing_now = _is_engine_playing()
+            if playing_now:
                 self._media_player.play()
             else:
                 # Ensure paused state
                 self._media_player.pause()
+
+            _reveal_after_seek(seek_ms, playing_now)
         
         # Update UI
         self.media_label.setText(clip.name)
@@ -785,12 +892,22 @@ class PreviewWidget(QWidget):
         """
         logger.debug("Displaying gap screen (black)")
 
-        # Pause media player to stop any playing video/audio
+        # Avoid hard stop here; stop() causes decoder reset and visible micro-stutter
+        # on next clip transitions. Pause is enough for gap silence/hold.
         self._media_player.pause()
 
         # Hide video widget and show black screen
         self.video_widget.hide()
         self._black_screen.show()
+
+        # Clear any stale frame in sink so previous clip frame cannot flash on reveal.
+        try:
+            sink = self.video_widget.videoSink()
+            if sink is not None:
+                sink.setVideoFrame(QVideoFrame())
+        except Exception:
+            # Backend may not expose sink operations consistently; safe to ignore.
+            pass
 
         # Mute audio to ensure no sound
         if self._audio_output:
@@ -812,7 +929,7 @@ class PreviewWidget(QWidget):
         if not clips:
             logger.warning("No clips to play")
             return
-        
+
         self._timeline_mode = True
         
         # Set clips in the playback engine
@@ -936,13 +1053,14 @@ class PreviewWidget(QWidget):
 
         # Handle gap or clip display
         if is_in_gap:
+            # In a gap: stop media player, show black screen, mute audio
             self._display_gap_screen()
         else:
-            # Show video widget, hide black screen
+            # In a clip: show video widget, hide black screen
             self.video_widget.show()
             self._black_screen.hide()
 
-            # Keep audio muted when not playing to prevent bleed
+            # Only restore audio volume if playing, otherwise keep muted
             if self._audio_output:
                 if self._is_playing:
                     self._audio_output.setVolume(1.0)
@@ -979,6 +1097,11 @@ class PreviewWidget(QWidget):
     
     def _on_duration_changed(self, duration_ms: int):
         """Handle media player duration changes (duration in milliseconds)."""
+        # In timeline mode, total duration must come from the timeline engine,
+        # not from the currently loaded source clip.
+        if self._timeline_mode:
+            return
+
         duration = duration_ms / 1000.0  # Convert to seconds
         if duration > 0:
             self._duration = duration
