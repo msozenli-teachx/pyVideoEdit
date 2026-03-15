@@ -424,6 +424,46 @@ class PreviewWidget(QWidget):
 
         self._update_time_display()
 
+    def set_timeline_mode_enabled(self, enabled: bool):
+        """Set whether preview is currently operating in timeline mode."""
+        self._timeline_mode = enabled
+
+    def get_timeline_playback_state(self) -> PlaybackState:
+        """Return current timeline playback state."""
+        if not self._timeline_playback_engine:
+            return PlaybackState.STOPPED
+        return self._timeline_playback_engine.state
+
+    def is_timeline_playing(self) -> bool:
+        """Return True when timeline engine is actively playing."""
+        return self.get_timeline_playback_state() == PlaybackState.PLAYING
+
+    def pause_preview_playback(self):
+        """Pause current preview playback and mute audio outputs."""
+        if self._timeline_mode and self._timeline_playback_engine:
+            self._timeline_playback_engine.pause()
+        self._media_player.pause()
+        if self._detached_audio_player:
+            self._detached_audio_player.pause()
+        self.mute_preview_audio()
+        self.set_playing(False)
+
+    def mute_preview_audio(self):
+        """Mute preview audio outputs."""
+        if self._audio_output:
+            self._audio_output.setVolume(0.0)
+        if self._detached_audio_output:
+            self._detached_audio_output.setVolume(0.0)
+
+    def scrub_to_source_position(self, source_position: float):
+        """Seek preview media to a source position and keep it paused."""
+        self._media_player.setPosition(int(max(0.0, source_position) * 1000))
+        self._media_player.pause()
+
+    def refresh_timeline_model(self, clips: List[TimelineClip]):
+        """Update preview timeline clip model without starting playback."""
+        self.set_timeline_clips(clips)
+
     def _set_slider_from_position(self):
         """Update position slider using current position and duration."""
         if self._duration <= 0:
@@ -762,10 +802,6 @@ class PreviewWidget(QWidget):
         
         self._current_file_path = str(media_path)
 
-        # Keep black screen until the new clip/frame is prepared to avoid old-frame flash.
-        self.video_widget.hide()
-        self._black_screen.show()
-
         def _is_engine_playing() -> bool:
             return bool(
                 self._timeline_playback_engine
@@ -839,6 +875,10 @@ class PreviewWidget(QWidget):
         new_source = QUrl.fromLocalFile(self._current_file_path)
         
         if current_source != new_source:
+            # Only blackout during real source switches.
+            self.video_widget.hide()
+            self._black_screen.show()
+
             # Need to load new source
             logger.debug(f"Loading new source: {self._current_file_path}")
             self._media_player.setSource(new_source)
@@ -897,7 +937,10 @@ class PreviewWidget(QWidget):
                 # Ensure paused state
                 self._media_player.pause()
 
-            _reveal_after_seek(seek_ms, playing_now)
+            # No source change: keep current video surface active for smoother
+            # segment-to-segment transitions in trimmed timelines.
+            self._black_screen.hide()
+            self.video_widget.show()
         
         # Update UI
         self.media_label.setText(clip.name)

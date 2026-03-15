@@ -82,6 +82,9 @@ class TimelinePlaybackEngine(QObject):
     
     # Constants
     TIMER_INTERVAL_MS = 16  # ~60fps for smooth playhead movement
+    PLAYING_RESYNC_THRESHOLD_S = 0.18
+    PAUSED_RESYNC_THRESHOLD_S = 0.05
+    RESYNC_COOLDOWN_S = 0.12
 
     def _should_play_clip_audio(self, clip: Optional[TimelineClip]) -> bool:
         """Return True when video player's own audio should be audible."""
@@ -143,6 +146,7 @@ class TimelinePlaybackEngine(QObject):
         
         # Time tracking for accurate position updates
         self._last_tick_time: float = 0.0
+        self._last_media_resync_time: float = 0.0
         
         # Clip sync tracking
         self._last_loaded_clip_id: Optional[str] = None
@@ -795,10 +799,20 @@ class TimelinePlaybackEngine(QObject):
         # Calculate the difference
         diff = abs(current_media_pos - source_position)
 
-        # Always sync if difference is significant (> 0.05 seconds for better responsiveness)
-        if diff > 0.05:
+        # Avoid aggressive setPosition calls while playing; frequent hard seeks
+        # can create visible micro-stutter on trimmed clips.
+        now = time.time()
+        threshold = (
+            self.PLAYING_RESYNC_THRESHOLD_S
+            if self._state == PlaybackState.PLAYING
+            else self.PAUSED_RESYNC_THRESHOLD_S
+        )
+        can_resync_now = (now - self._last_media_resync_time) >= self.RESYNC_COOLDOWN_S
+
+        if diff > threshold and can_resync_now:
             logger.debug(f"Syncing media player: {current_media_pos:.2f}s -> {source_position:.2f}s")
             self._media_player.setPosition(int(source_position * 1000))
+            self._last_media_resync_time = now
 
         # Handle media player state based on our state
         from PyQt6.QtMultimedia import QMediaPlayer
