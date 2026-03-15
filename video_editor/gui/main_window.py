@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QFileDialog, QMessageBox, QStatusBar, QLabel, QProgressBar
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from pathlib import Path
 from typing import Optional
 
@@ -86,6 +86,11 @@ class MainWindow(QMainWindow):
         self._is_processing: bool = False
         self._process_worker: Optional[ProcessWorker] = None
         self._updating_from_preview: bool = False
+        self._pending_scrub_position: Optional[float] = None
+        self._scrub_preview_timer = QTimer(self)
+        self._scrub_preview_timer.setSingleShot(True)
+        self._scrub_preview_timer.setInterval(24)
+        self._scrub_preview_timer.timeout.connect(self._flush_scrub_preview_update)
         
         # Setup UI
         self.setWindowTitle(f"{self.settings.app_name} v{self.settings.app_version}")
@@ -182,6 +187,9 @@ class MainWindow(QMainWindow):
         self.timeline.clip_trimmed.connect(self._on_clip_trimmed)
         self.timeline.clip_moved.connect(self._on_clip_moved_on_timeline)
         self.timeline.split_requested.connect(self._on_split_requested)
+        self.timeline.clip_volume_changed.connect(self._on_clip_volume_changed)
+        self.timeline.clip_mute_toggled.connect(self._on_clip_mute_toggled)
+        self.timeline.detach_audio_requested.connect(self._on_detach_audio_requested)
         
         # Editor service signals
         self._editor_service.media_imported.connect(self._on_media_imported)
@@ -437,6 +445,28 @@ class MainWindow(QMainWindow):
         if getattr(self, '_updating_from_preview', False):
             return
 
+        # Coalesce dense playhead drag events so preview seeks are not executed
+        # on every mouse-move pixel.
+        if self.timeline.is_dragging_playhead() and not self.timeline.is_dragging_clip():
+            self._pending_scrub_position = position
+            if not self._scrub_preview_timer.isActive():
+                self._scrub_preview_timer.start()
+            return
+
+        self._apply_timeline_position_to_preview(position)
+
+    def _flush_scrub_preview_update(self):
+        """Apply the latest pending playhead scrub position to preview."""
+        if self._pending_scrub_position is None:
+            return
+
+        position = self._pending_scrub_position
+        self._pending_scrub_position = None
+        self._apply_timeline_position_to_preview(position)
+
+    def _apply_timeline_position_to_preview(self, position: float):
+        """Sync preview state to a timeline/playhead position."""
+
         # 1. Handle special case: dragging a clip
         if self.timeline.is_dragging_clip():
             drag_info = self.timeline.get_dragging_clip_info()
@@ -532,12 +562,6 @@ class MainWindow(QMainWindow):
         # Re-apply total duration after possible media loads/seeks in click path.
         # Some media updates can overwrite preview duration with source clip duration.
         self.preview.set_timeline_total_duration(self._editor_service.get_timeline_duration())
-
-        # Ensure preview slider/time display stays synced with playhead
-        if clip_under_playhead:
-            self.preview.set_position(position)
-        else:
-            self.preview.sync_to_playhead(position, is_in_gap=True)
     
     def _on_clip_selected_on_timeline(self, clip_id: str):
         """Handle clip selection on timeline."""
@@ -547,7 +571,43 @@ class MainWindow(QMainWindow):
             if clip.clip_id == clip_id:
                 # Update service if needed
                 self._editor_service.move_clip(clip_id, clip.timeline_start)
+                self.timeline.update_volume_slider_for_clip(clip)
                 break
+
+    def _on_clip_volume_changed(self, clip_id: str, volume: float):
+        """Handle timeline clip volume changes."""
+        if not self._editor_service.set_clip_volume(clip_id, volume):
+            self.status_bar.showMessage("Select an eligible clip for audio control", 2000)
+            return
+
+        clip = self._editor_service.get_clip_by_id(clip_id)
+        if clip:
+            self.timeline.update_volume_slider_for_clip(clip)
+            if volume > 1.0:
+                self.status_bar.showMessage(
+                    f"'{clip.name}' volume: {int(volume * 100)}% (live preview max 100%)",
+                    2500,
+                )
+            else:
+                self.status_bar.showMessage(f"'{clip.name}' volume: {int(volume * 100)}%", 2000)
+
+        if hasattr(self.preview, "update_current_clip_volume"):
+            self.preview.update_current_clip_volume()
+
+    def _on_clip_mute_toggled(self, clip_id: str):
+        """Handle timeline clip mute toggle."""
+        new_state = self._editor_service.toggle_clip_mute(clip_id)
+        if new_state is None:
+            self.status_bar.showMessage("Select an eligible clip for mute", 2000)
+            return
+
+        clip = self._editor_service.get_clip_by_id(clip_id)
+        if clip:
+            self.timeline.update_volume_slider_for_clip(clip)
+            self.status_bar.showMessage(f"'{clip.name}' {'muted' if new_state else 'unmuted'}", 2000)
+
+        if hasattr(self.preview, "update_current_clip_volume"):
+            self.preview.update_current_clip_volume()
 
     def _on_clip_trimmed(self, clip_id: str, new_start: float, new_end: float):
         """Handle clip trim update from timeline."""
@@ -586,6 +646,31 @@ class MainWindow(QMainWindow):
             self.preview._timeline_playback_engine.set_timeline_clips(sorted_clips)
         self.preview.set_timeline_clips(sorted_clips)
         self.status_bar.showMessage("Clip split", 2000)
+
+    def _on_detach_audio_requested(self, clip_id: str = ""):
+        """Detach audio for all eligible timeline clips."""
+        audio_clips = self._editor_service.detach_all_audio()
+        if not audio_clips:
+            self.status_bar.showMessage("No clips available for detach", 2500)
+            return
+
+        # Ensure audio track exists
+        if len(self.timeline._tracks) < 2:
+            self.timeline.add_track("Audio 1", 60)
+
+        for clip in audio_clips:
+            self.timeline.add_clip_to_track(1, clip)
+
+        sorted_clips = self._editor_service.get_sorted_timeline_clips()
+        if self.preview._timeline_playback_engine:
+            self.preview._timeline_playback_engine.set_timeline_clips(sorted_clips)
+        self.preview.set_timeline_clips(sorted_clips)
+
+        selected_id = self.timeline._get_selected_clip_id()
+        if selected_id:
+            self.timeline.update_volume_slider_for_clip(self._editor_service.get_clip_by_id(selected_id))
+
+        self.status_bar.showMessage(f"Detached audio for {len(audio_clips)} clips", 3000)
 
     def _on_preview_position_changed(self, position: float):
         """Handle preview position change - sync with timeline."""

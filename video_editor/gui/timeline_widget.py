@@ -6,7 +6,7 @@ Supports drag and drop from media pool.
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QScrollArea, QMenu
+    QScrollArea, QMenu, QSlider
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QRect, QPointF, QSize
 from PyQt6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QAction, QMouseEvent, QPaintEvent, QDragEnterEvent, QDropEvent, QPolygonF, QIcon, QPixmap
@@ -35,6 +35,61 @@ def _create_split_icon() -> QIcon:
     # Blades (centered)
     painter.drawLine(4, 3, 11, 1)
     painter.drawLine(4, 8, 11, 11)
+
+    painter.end()
+    return QIcon(pixmap)
+
+
+def _create_speaker_icon() -> QIcon:
+    """Create a speaker/audio icon."""
+    pixmap = QPixmap(16, 16)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+    pen = QPen(QColor("#ffffff"))
+    pen.setWidth(1)
+    painter.setPen(pen)
+
+    speaker = QPolygonF([
+        QPointF(2, 6),
+        QPointF(6, 6),
+        QPointF(10, 2),
+        QPointF(10, 14),
+        QPointF(6, 10),
+        QPointF(2, 10)
+    ])
+    painter.drawPolygon(speaker)
+
+    painter.end()
+    return QIcon(pixmap)
+
+
+def _create_muted_icon() -> QIcon:
+    """Create a muted speaker icon with X."""
+    pixmap = QPixmap(16, 16)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+    pen = QPen(QColor("#ff5555"))
+    pen.setWidth(1)
+    painter.setPen(pen)
+
+    speaker = QPolygonF([
+        QPointF(1, 6),
+        QPointF(5, 6),
+        QPointF(9, 2),
+        QPointF(9, 14),
+        QPointF(5, 10),
+        QPointF(1, 10)
+    ])
+    painter.drawPolygon(speaker)
+
+    pen.setWidth(2)
+    painter.setPen(pen)
+    painter.drawLine(11, 5, 15, 11)
+    painter.drawLine(15, 5, 11, 11)
 
     painter.end()
     return QIcon(pixmap)
@@ -78,6 +133,8 @@ class TimelineTrack(QWidget):
     clip_trimmed = pyqtSignal(str, float, float)  # clip_id, new_timeline_start, new_timeline_end
     split_requested = pyqtSignal(str)  # clip_id
     playhead_moved = pyqtSignal(float)   # new_position in seconds
+    clip_volume_changed = pyqtSignal(str, float)  # clip_id, volume (0.0 to 2.0)
+    clip_mute_toggled = pyqtSignal(str)  # clip_id
     
     def __init__(self, track_id: int, name: str, height: int = 60, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -159,6 +216,7 @@ class TimelineTrack(QWidget):
             for clip in self.clips:
                 if clip.timeline_start <= click_time <= clip.timeline_start + clip.duration:
                     self._selected_clip_id = clip.clip_id
+                    self._notify_clip_selected(clip.clip_id)
                     self.update()
                     menu = QMenu(self)
                     split_action = QAction("Split at Playhead", self)
@@ -186,6 +244,7 @@ class TimelineTrack(QWidget):
                     self._drag_clip_source_start = clip.start_time
                     self._drag_clip_source_end = clip.end_time
                     self._selected_clip_id = clip.clip_id
+                    self._notify_clip_selected(clip.clip_id)
 
                     # Determine if trimming left/right edge
                     left_edge = clip.timeline_start * self._pixels_per_second
@@ -233,19 +292,27 @@ class TimelineTrack(QWidget):
 
             return (min_bound, max_bound)
 
-        else:  # trim_right
-            # Right trim: find the clip to the right
-            min_bound = target_clip.timeline_start + min_duration
-            max_bound = float('inf')
+        # trim_right
+        min_bound = target_clip.timeline_start + min_duration
+        max_bound = float('inf')
 
-            for clip in self.clips:
-                if clip.clip_id == clip_id:
-                    continue
-                # If this clip starts where our target clip ends (or after)
-                if clip.timeline_start >= target_clip.timeline_start + target_clip.duration - 0.001:
-                    max_bound = min(max_bound, clip.timeline_start)
+        for clip in self.clips:
+            if clip.clip_id == clip_id:
+                continue
+            # If this clip starts where our target clip ends (or after)
+            if clip.timeline_start >= target_clip.timeline_start + target_clip.duration - 0.001:
+                max_bound = min(max_bound, clip.timeline_start)
 
-            return (min_bound, max_bound)
+        return (min_bound, max_bound)
+
+    def _notify_clip_selected(self, clip_id: str):
+        """Notify parent TimelineWidget when a clip becomes selected."""
+        parent = self.parent()
+        while parent:
+            if isinstance(parent, TimelineWidget):
+                parent.clip_selected.emit(clip_id)
+                return
+            parent = parent.parent()
 
     def mouseMoveEvent(self, event: QMouseEvent):
         if self._is_dragging_clip and self._drag_clip_id:
@@ -532,6 +599,10 @@ class TimelineTrack(QWidget):
         painter.setPen(pen)
         
         painter.drawRoundedRect(rect, 4, 4)
+
+        # Draw a simple waveform style for audio clips.
+        if getattr(clip, "is_audio_only", False):
+            self._draw_audio_waveform(painter, rect, clip)
         
         # Draw clip name
         painter.setPen(QColor("#ffffff"))
@@ -548,6 +619,28 @@ class TimelineTrack(QWidget):
         painter.setFont(font)
         duration_text = f"{clip.duration:.1f}s"
         painter.drawText(text_rect, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom, duration_text)
+
+    def _draw_audio_waveform(self, painter: QPainter, rect: QRect, clip: TimelineClip):
+        """Draw stylized waveform bars for audio clips."""
+        inner = rect.adjusted(6, 8, -6, -8)
+        if inner.width() < 10 or inner.height() < 8:
+            return
+
+        center_y = inner.center().y()
+        bar_count = max(8, inner.width() // 6)
+        spacing = max(2, inner.width() // bar_count)
+        seed = sum(ord(ch) for ch in clip.clip_id)
+
+        waveform_pen = QPen(QColor("#e6f7ff"))
+        waveform_pen.setWidth(1)
+        painter.setPen(waveform_pen)
+
+        for i in range(bar_count):
+            # Deterministic pseudo-waveform so each clip looks consistent.
+            amp_ratio = 0.2 + (((seed + i * 37) % 80) / 100.0)
+            amp = int((inner.height() * amp_ratio) / 2)
+            x = inner.left() + i * spacing
+            painter.drawLine(x, center_y - amp, x, center_y + amp)
 
 
 class TimeRuler(QWidget):
@@ -647,6 +740,9 @@ class TimelineWidget(QWidget):
     clip_trimmed = pyqtSignal(str, float, float)  # clip_id, new_timeline_start, new_timeline_end
     clip_moved = pyqtSignal(str, float)  # clip_id, new_timeline_start
     split_requested = pyqtSignal(str)
+    detach_audio_requested = pyqtSignal(str)
+    clip_volume_changed = pyqtSignal(str, float)  # clip_id, volume (0.0 to 2.0)
+    clip_mute_toggled = pyqtSignal(str)  # clip_id
     
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -658,6 +754,9 @@ class TimelineWidget(QWidget):
         
         self._setup_ui()
         self._add_default_tracks()
+
+        # Keep a single selected clip across all tracks.
+        self.clip_selected.connect(self._sync_selected_clip_across_tracks)
     
     def _setup_ui(self):
         """Setup the widget UI."""
@@ -685,6 +784,58 @@ class TimelineWidget(QWidget):
         split_btn.setStyleSheet("background-color: #3a3a3a; border: 1px solid #555555; padding: 0px;")
         split_btn.clicked.connect(self._request_split_from_toolbar)
         header_layout.addWidget(split_btn)
+
+        self.detach_btn = QPushButton()
+        self.detach_btn.setToolTip("Detach audio for all timeline clips")
+        self.detach_btn.setFixedSize(24, 22)
+        self.detach_btn.setText("🔊↗")
+        self.detach_btn.setStyleSheet("background-color: #3a3a3a; border: 1px solid #555555; padding: 0px; font-size: 10px;")
+        self.detach_btn.clicked.connect(self._request_detach_audio)
+        header_layout.addWidget(self.detach_btn)
+
+        self.mute_btn = QPushButton()
+        self.mute_btn.setToolTip("Mute/unmute selected clip")
+        self.mute_btn.setFixedSize(24, 22)
+        self.mute_btn.setIcon(_create_speaker_icon())
+        self.mute_btn.setIconSize(QSize(12, 12))
+        self.mute_btn.setStyleSheet("background-color: #3a3a3a; border: 1px solid #555555; padding: 0px;")
+        self.mute_btn.clicked.connect(self._toggle_mute)
+        header_layout.addWidget(self.mute_btn)
+
+        self.volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.volume_slider.setMinimum(0)
+        self.volume_slider.setMaximum(200)
+        self.volume_slider.setValue(100)
+        self.volume_slider.setFixedWidth(80)
+        self.volume_slider.setToolTip("Volume: 100%")
+        self.volume_slider.setStyleSheet(
+            "QSlider::groove:horizontal {"
+            " border: 1px solid #555555;"
+            " height: 6px;"
+            " background: #2d2d2d;"
+            " border-radius: 3px;"
+            "}"
+            "QSlider::handle:horizontal {"
+            " background: #00bcd4;"
+            " border: 1px solid #00bcd4;"
+            " width: 12px;"
+            " margin: -4px 0;"
+            " border-radius: 6px;"
+            "}"
+            "QSlider::sub-page:horizontal {"
+            " background: #00bcd4;"
+            " border-radius: 3px;"
+            "}"
+        )
+        self.volume_slider.valueChanged.connect(self._on_volume_slider_changed)
+        header_layout.addWidget(self.volume_slider)
+
+        self.volume_label = QLabel("100%")
+        self.volume_label.setObjectName("timeLabel")
+        self.volume_label.setMinimumWidth(35)
+        header_layout.addWidget(self.volume_label)
+
+        self._set_audio_controls_enabled(False)
         
         header_layout.addStretch()
         
@@ -793,6 +944,8 @@ class TimelineWidget(QWidget):
         track.clip_trimmed.connect(self._on_clip_trimmed)
         track.split_requested.connect(self._on_split_requested)
         track.playhead_moved.connect(self.set_playhead_position)
+        track.clip_volume_changed.connect(self.clip_volume_changed.emit)
+        track.clip_mute_toggled.connect(self.clip_mute_toggled.emit)
         
         # Track header
         track_header = QWidget()
@@ -839,12 +992,104 @@ class TimelineWidget(QWidget):
         if clip_id:
             self.split_requested.emit(clip_id)
 
+    def _request_detach_audio(self):
+        """Request audio detach for timeline."""
+        clip_id = self._get_selected_clip_id() or ""
+        self.detach_audio_requested.emit(clip_id)
+
+    def _find_clip_by_id(self, clip_id: str) -> Optional[TimelineClip]:
+        """Find clip by id across all tracks."""
+        for track in self._tracks:
+            for clip in track.clips:
+                if clip.clip_id == clip_id:
+                    return clip
+        return None
+
+    def _get_controllable_clip_for_audio_controls(self) -> Optional[TimelineClip]:
+        """Return selected clip if it is eligible for direct audio control."""
+        clip_id = self._get_selected_clip_id()
+        if not clip_id:
+            return None
+
+        clip = self._find_clip_by_id(clip_id)
+        if not clip:
+            return None
+
+        # If a video clip has detached audio, only the detached/audio clip
+        # itself is allowed to be controlled.
+        if getattr(clip, "has_detached_audio", False) and not getattr(clip, "is_audio_only", False):
+            return None
+
+        return clip
+
+    def _set_audio_controls_enabled(self, enabled: bool):
+        self.mute_btn.setEnabled(enabled)
+        self.volume_slider.setEnabled(enabled)
+
+    def _on_volume_slider_changed(self, value: int):
+        """Handle volume slider change for selected eligible clip."""
+        self.volume_label.setText(f"{value}%")
+        self.volume_slider.setToolTip(f"Volume: {value}%")
+
+        clip = self._get_controllable_clip_for_audio_controls()
+        if not clip:
+            return
+
+        self.clip_volume_changed.emit(clip.clip_id, value / 100.0)
+
+    def _toggle_mute(self):
+        """Toggle mute on selected eligible clip."""
+        clip = self._get_controllable_clip_for_audio_controls()
+        if not clip:
+            return
+        self.clip_mute_toggled.emit(clip.clip_id)
+
+    def update_mute_button_state(self, muted: bool):
+        """Update mute button icon for selected clip state."""
+        self.mute_btn.setIcon(_create_muted_icon() if muted else _create_speaker_icon())
+
+    def update_volume_slider_for_clip(self, clip: Optional[TimelineClip]):
+        """Sync header controls with selected clip volume and mute values."""
+        if not clip:
+            self._set_audio_controls_enabled(False)
+            self.volume_slider.blockSignals(True)
+            self.volume_slider.setValue(100)
+            self.volume_slider.blockSignals(False)
+            self.volume_label.setText("100%")
+            self.volume_slider.setToolTip("Volume: 100%")
+            self.update_mute_button_state(False)
+            return
+
+        selected_clip_id = self._get_selected_clip_id()
+        is_selected = bool(selected_clip_id and selected_clip_id == clip.clip_id)
+        is_detached_parent = bool(
+            getattr(clip, "has_detached_audio", False) and not getattr(clip, "is_audio_only", False)
+        )
+
+        self._set_audio_controls_enabled(is_selected and not is_detached_parent)
+
+        volume_pct = int(max(0.0, min(2.0, float(getattr(clip, "volume", 1.0)))) * 100)
+        self.volume_slider.blockSignals(True)
+        self.volume_slider.setValue(volume_pct)
+        self.volume_slider.blockSignals(False)
+
+        self.volume_label.setText(f"{volume_pct}%")
+        self.volume_slider.setToolTip(f"Volume: {volume_pct}%")
+        self.update_mute_button_state(bool(getattr(clip, "muted", False)))
+
     def _get_selected_clip_id(self) -> Optional[str]:
         """Get selected clip id from tracks."""
         for track in self._tracks:
             if track._selected_clip_id:
                 return track._selected_clip_id
         return None
+
+    def _sync_selected_clip_across_tracks(self, clip_id: str):
+        """Ensure only one clip is selected at a time across all tracks."""
+        for track in self._tracks:
+            has_clip = any(c.clip_id == clip_id for c in track.clips)
+            track._selected_clip_id = clip_id if has_clip else None
+            track.update()
 
     def _get_clip_at_playhead(self) -> Optional[str]:
         """Get first clip id under playhead."""
@@ -913,6 +1158,15 @@ class TimelineWidget(QWidget):
         """Check if any track is currently dragging a clip."""
         for track in self._tracks:
             if track._is_dragging_clip:
+                return True
+        return False
+
+    def is_dragging_playhead(self) -> bool:
+        """Check if any track or ruler is currently dragging the playhead."""
+        if self.time_ruler._is_dragging:
+            return True
+        for track in self._tracks:
+            if track._is_dragging_playhead:
                 return True
         return False
 

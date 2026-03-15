@@ -10,7 +10,6 @@ from PyQt6.QtWidgets import (
     QSlider, QFrame, QSizePolicy, QLineEdit, QGroupBox
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QUrl
-from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoFrame
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 from typing import Optional, List
@@ -83,6 +82,17 @@ class PreviewWidget(QWidget):
         self._timeline_playback_engine.set_callbacks(
             on_clip_load=self._load_and_play_clip_segment,
             on_gap_display=self._display_gap_screen
+        )
+
+        # Media player is created before engine initialization in __init__,
+        # so wire player references here.
+        self._timeline_playback_engine.set_media_player(
+            self._media_player,
+            self._audio_output,
+            self.video_widget,
+            self._black_screen,
+            self._detached_audio_player,
+            self._detached_audio_output,
         )
         
         logger.info("Timeline playback engine initialized")
@@ -270,6 +280,12 @@ class PreviewWidget(QWidget):
         # Create audio output
         self._audio_output = QAudioOutput()
         self._audio_output.setVolume(1.0)
+
+        # Detached audio output/player (independent from video clip player)
+        self._detached_audio_output = QAudioOutput()
+        self._detached_audio_output.setVolume(1.0)
+        self._detached_audio_player = QMediaPlayer()
+        self._detached_audio_player.setAudioOutput(self._detached_audio_output)
         
         # Create media player
         self._media_player = QMediaPlayer()
@@ -288,7 +304,9 @@ class PreviewWidget(QWidget):
                 self._media_player,
                 self._audio_output,
                 self.video_widget,
-                self._black_screen
+                self._black_screen,
+                self._detached_audio_player,
+                self._detached_audio_output,
             )
     
     def load_video(self, file_path: str, name: str, duration: float):
@@ -405,18 +423,53 @@ class PreviewWidget(QWidget):
             self.position_slider.blockSignals(False)
 
         self._update_time_display()
-    
-    def set_frame(self, image: QImage):
-        """Display a video frame.
-        
-        Args:
-            image: QImage to display
-        """
-        if image and not image.isNull():
-            pixmap = QPixmap.fromImage(image)
-            self.image_label.setPixmap(pixmap)
-            self.image_label.show()
-            self.placeholder_label.hide()
+
+    def _set_slider_from_position(self):
+        """Update position slider using current position and duration."""
+        if self._duration <= 0:
+            return
+        slider_value = int((self._current_position / self._duration) * 1000)
+        self.position_slider.blockSignals(True)
+        self.position_slider.setValue(slider_value)
+        self.position_slider.blockSignals(False)
+
+    def _stop_players_and_mute(self, clear_source: bool = False):
+        """Stop preview players and silence outputs."""
+        self._media_player.stop()
+        self._media_player.pause()
+
+        if clear_source:
+            current_source = self._media_player.source()
+            self._media_player.setSource(QUrl())
+            if current_source:
+                self._media_player.setSource(current_source)
+                self._media_player.pause()
+
+        if self._detached_audio_player:
+            self._detached_audio_player.stop()
+            self._detached_audio_player.pause()
+
+        if self._audio_output:
+            self._audio_output.setVolume(0.0)
+        if self._detached_audio_output:
+            self._detached_audio_output.setVolume(0.0)
+
+    def _reset_transport_ui(self, media_label: Optional[str] = None):
+        """Reset transport/playhead UI state after a stop/finish action."""
+        self._is_playing = False
+        self._current_position = 0.0
+        self._update_play_button()
+        self._update_time_display()
+
+        self.position_slider.blockSignals(True)
+        self.position_slider.setValue(0)
+        self.position_slider.blockSignals(False)
+
+        self._black_screen.show()
+        self.video_widget.hide()
+
+        if media_label is not None:
+            self.media_label.setText(media_label)
     
     def set_playing(self, playing: bool):
         """Set the playback state.
@@ -512,50 +565,52 @@ class PreviewWidget(QWidget):
     
     def _on_play_clicked(self):
         """Handle play/pause button click."""
-        if self._timeline_mode:
-            # Use timeline playback engine
-            if self._timeline_playback_engine:
-                if self._timeline_playback_engine.state == PlaybackState.PLAYING:
-                    self._timeline_playback_engine.pause()
-                    # Also pause media player and mute audio immediately
-                    self._media_player.pause()
-                    if self._audio_output:
-                        self._audio_output.setVolume(0.0)
-                    self.pause_clicked.emit()
-                elif self._timeline_playback_engine.state == PlaybackState.PAUSED:
-                    self._timeline_playback_engine.resume()
-                    # Restore audio volume on resume
-                    if self._audio_output:
-                        self._audio_output.setVolume(1.0)
-                    self.play_clicked.emit()
-                else:
-                    # STOPPED state - need to start playback
-                    # Get current position from slider
-                    if self._duration > 0:
-                        start_pos = (self.position_slider.value() / 1000) * self._duration
+        try:
+            if self._timeline_mode:
+                # Use timeline playback engine
+                if self._timeline_playback_engine:
+                    if self._timeline_playback_engine.state == PlaybackState.PLAYING:
+                        self._timeline_playback_engine.pause()
+                        # Also pause media player and mute audio immediately
+                        self._media_player.pause()
+                        if self._audio_output:
+                            self._audio_output.setVolume(0.0)
+                        self.pause_clicked.emit()
+                    elif self._timeline_playback_engine.state == PlaybackState.PAUSED:
+                        self._timeline_playback_engine.resume()
+                        self.play_clicked.emit()
                     else:
-                        start_pos = 0
-                    self._timeline_playback_engine.play(start_pos)
-                    # Restore audio volume on start
-                    if self._audio_output:
-                        self._audio_output.setVolume(1.0)
-                    self.play_clicked.emit()
-            return
+                        # STOPPED state - need to start playback
+                        # Get current position from slider
+                        if self._duration > 0:
+                            start_pos = (self.position_slider.value() / 1000) * self._duration
+                        else:
+                            start_pos = 0
+                        self._timeline_playback_engine.play(start_pos)
+                        self.play_clicked.emit()
+                return
 
-        # Single media playback mode
-        if self._current_file_path is None:
-            return
+            # Single media playback mode
+            if self._current_file_path is None:
+                return
 
-        if self._is_playing:
-            self._media_player.pause()
-            if self._audio_output:
-                self._audio_output.setVolume(0.0)
-            self.pause_clicked.emit()
-        else:
-            if self._audio_output:
-                self._audio_output.setVolume(1.0)
-            self._media_player.play()
-            self.play_clicked.emit()
+            if self._is_playing:
+                self._media_player.pause()
+                if self._audio_output:
+                    self._audio_output.setVolume(0.0)
+                self.pause_clicked.emit()
+            else:
+                if self._audio_output:
+                    self._audio_output.setVolume(1.0)
+                self._media_player.play()
+                self.play_clicked.emit()
+        except Exception as e:
+            logger.exception("Play click handling failed")
+            self._is_playing = False
+            self._update_play_button()
+            self._display_gap_screen()
+            self.placeholder_label.setText(f"Playback error:\n{e}")
+            self.placeholder_label.show()
     
     def _on_stop_clicked(self):
         """Handle stop button click.
@@ -567,30 +622,9 @@ class PreviewWidget(QWidget):
         if self._timeline_playback_engine:
             self._timeline_playback_engine.stop()
 
-        # Always stop the local media player and mute audio
-        self._media_player.stop()
-        self._media_player.pause()
-
-        if self._audio_output:
-            self._audio_output.setVolume(0.0)
-
-        # Show black screen
-        self._black_screen.show()
-        self.video_widget.hide()
-
         self._timeline_mode = False
-        self._is_playing = False
-        self._current_position = 0.0
-        self._update_play_button()
-        self._update_time_display()
-
-        # Reset slider to beginning
-        self.position_slider.blockSignals(True)
-        self.position_slider.setValue(0)
-        self.position_slider.blockSignals(False)
-
-        # Update media label
-        self.media_label.setText("Stopped")
+        self._stop_players_and_mute()
+        self._reset_transport_ui(media_label="Stopped")
 
         self.stop_clicked.emit()
     
@@ -665,11 +699,7 @@ class PreviewWidget(QWidget):
         self._current_position = position
 
         # Update slider to match playhead position
-        if self._duration > 0:
-            slider_value = int((position / self._duration) * 1000)
-            self.position_slider.blockSignals(True)
-            self.position_slider.setValue(slider_value)
-            self.position_slider.blockSignals(False)
+        self._set_slider_from_position()
 
         # Update time display
         self._update_time_display()
@@ -699,23 +729,10 @@ class PreviewWidget(QWidget):
     def _on_timeline_finished(self):
         """Handle timeline playback finished."""
         logger.info("Timeline playback finished")
-        
-        # Ensure media player is stopped and audio muted
-        self._media_player.stop()
-        self._media_player.pause()
-        if self._audio_output:
-            self._audio_output.setVolume(0.0)
-            
+
+        self._stop_players_and_mute()
         self._timeline_mode = False
-        self._is_playing = False
-        self._current_position = 0.0
-        self._update_play_button()
-        self._update_time_display()
-        
-        # Reset slider to beginning
-        self.position_slider.blockSignals(True)
-        self.position_slider.setValue(0)
-        self.position_slider.blockSignals(False)
+        self._reset_transport_ui()
     
     def _on_playback_error(self, error_message: str):
         """Handle playback error."""
@@ -759,7 +776,9 @@ class PreviewWidget(QWidget):
             self._black_screen.hide()
             self.video_widget.show()
             if self._audio_output:
-                self._audio_output.setVolume(1.0 if is_playing_now else 0.0)
+                # Engine controls whether video-clip audio should be audible
+                # (e.g. muted when clip audio is detached).
+                self._audio_output.setVolume(0.0 if not is_playing_now else self._audio_output.volume())
 
         def _reveal_after_seek(target_ms: int, is_playing_now: bool):
             """Reveal video only after seek settles to avoid stale-frame flash."""
@@ -957,38 +976,11 @@ class PreviewWidget(QWidget):
         if self._timeline_playback_engine:
             self._timeline_playback_engine.stop()
 
-        # Stop and clear media player
-        self._media_player.stop()
-        self._media_player.pause()
-
-        # Clear media source to release buffers, then restore
-        from PyQt6.QtCore import QUrl
-        current_source = self._media_player.source()
-        self._media_player.setSource(QUrl())
-        if current_source:
-            self._media_player.setSource(current_source)
-            self._media_player.pause()
-
-        # Mute audio
-        if self._audio_output:
-            self._audio_output.setVolume(0.0)
+        self._stop_players_and_mute(clear_source=True)
 
         # Reset state
         self._timeline_mode = False
-        self._is_playing = False
-        self._current_position = 0.0
-
-        # Show black screen, hide video
-        self._black_screen.show()
-        self.video_widget.hide()
-
-        # Reset slider
-        self.position_slider.blockSignals(True)
-        self.position_slider.setValue(0)
-        self.position_slider.blockSignals(False)
-
-        self._update_play_button()
-        self._update_time_display()
+        self._reset_transport_ui()
 
         logger.info("Timeline playback stopped and reset")
     
@@ -1009,13 +1001,13 @@ class PreviewWidget(QWidget):
                 self._current_position = self._duration
                 
             self._update_time_display()
-            
-            # Update slider range if duration changed
-            # Actually slider is 0-1000, so it's relative.
-            # But we should update the slider position.
-            if self._duration > 0:
-                slider_value = int((self._current_position / self._duration) * 1000)
-                self.position_slider.setValue(slider_value)
+
+            self._set_slider_from_position()
+
+    def update_current_clip_volume(self):
+        """Apply updated clip volume/mute settings to active timeline playback."""
+        if self._timeline_playback_engine:
+            self._timeline_playback_engine.update_current_clip_volume()
     
     def seek_timeline(self, position: float):
         """Seek to a position in the timeline.
@@ -1042,11 +1034,7 @@ class PreviewWidget(QWidget):
         self._current_position = position
 
         # Update slider
-        if self._duration > 0:
-            slider_value = int((position / self._duration) * 1000)
-            self.position_slider.blockSignals(True)
-            self.position_slider.setValue(slider_value)
-            self.position_slider.blockSignals(False)
+        self._set_slider_from_position()
 
         # Update time display
         self._update_time_display()
@@ -1082,13 +1070,8 @@ class PreviewWidget(QWidget):
         
         position = position_ms / 1000.0  # Convert to seconds
         self._current_position = position
-        
-        # Update slider
-        if self._duration > 0:
-            slider_value = int((position / self._duration) * 1000)
-            self.position_slider.blockSignals(True)
-            self.position_slider.setValue(slider_value)
-            self.position_slider.blockSignals(False)
+
+        self._set_slider_from_position()
         
         self._update_time_display()
         

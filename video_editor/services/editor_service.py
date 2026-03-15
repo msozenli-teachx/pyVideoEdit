@@ -53,6 +53,11 @@ class TimelineClip:
     source_media_start: float = 0.0  # Original source media start (immutable)
     source_media_end: float = 0.0    # Original source media end (immutable)
     track_id: int = 0
+    volume: float = 1.0
+    muted: bool = False
+    clip_type: str = "video"  # "video", "audio", "detached_audio"
+    linked_clip_id: Optional[str] = None
+    has_detached_audio: bool = False
     
     def __post_init__(self):
         """Initialize source media bounds if not set."""
@@ -60,6 +65,15 @@ class TimelineClip:
             # First creation - set the original bounds
             self.source_media_start = self.start_time
             self.source_media_end = self.end_time
+
+    @property
+    def is_audio_only(self) -> bool:
+        """Check if this clip is audio-only on the timeline."""
+        return self.clip_type in ("audio", "detached_audio")
+
+    def get_effective_volume(self) -> float:
+        """Effective volume (mute-aware)."""
+        return 0.0 if self.muted else self.volume
 
 
 @dataclass
@@ -282,7 +296,8 @@ class EditorService(QObject):
             file_path=str(media.file_path),
             source_media_start=start_time,
             source_media_end=end_time,
-            track_id=track_id
+            track_id=track_id,
+            clip_type=("audio" if media.media_type == MediaType.AUDIO else "video")
         )
         
         self._timeline_clips.append(clip)
@@ -425,6 +440,80 @@ class EditorService(QObject):
                 return clip
         return None
 
+    def _is_direct_audio_control_allowed(self, clip: TimelineClip) -> bool:
+        """Only detached/audio clip is controllable once audio is detached."""
+        if clip.has_detached_audio and not clip.is_audio_only:
+            return False
+        return True
+
+    def set_clip_volume(self, clip_id: str, volume: float) -> bool:
+        """Set clip volume (0.0 to 2.0) if clip is eligible for direct control."""
+        clip = self.get_clip_by_id(clip_id)
+        if not clip or not self._is_direct_audio_control_allowed(clip):
+            return False
+        clip.volume = max(0.0, min(2.0, volume))
+        self.timeline_updated.emit()
+        return True
+
+    def set_clip_muted(self, clip_id: str, muted: bool) -> bool:
+        """Set clip mute state if clip is eligible for direct control."""
+        clip = self.get_clip_by_id(clip_id)
+        if not clip or not self._is_direct_audio_control_allowed(clip):
+            return False
+        clip.muted = muted
+        self.timeline_updated.emit()
+        return True
+
+    def toggle_clip_mute(self, clip_id: str) -> Optional[bool]:
+        """Toggle clip mute state if clip is eligible for direct control."""
+        clip = self.get_clip_by_id(clip_id)
+        if not clip or not self._is_direct_audio_control_allowed(clip):
+            return None
+        clip.muted = not clip.muted
+        self.timeline_updated.emit()
+        return clip.muted
+
+    def detach_audio_from_clip(self, clip_id: str) -> Optional[TimelineClip]:
+        """Detach audio from a single video clip by creating an audio-only clip."""
+        video_clip = self.get_clip_by_id(clip_id)
+        if not video_clip or video_clip.is_audio_only or video_clip.has_detached_audio:
+            return None
+
+        audio_clip = TimelineClip(
+            clip_id=str(uuid.uuid4())[:8],
+            media_id=video_clip.media_id,
+            name=f"{video_clip.name} [Audio]",
+            start_time=video_clip.start_time,
+            end_time=video_clip.end_time,
+            timeline_start=video_clip.timeline_start,
+            duration=video_clip.duration,
+            color="#ff9800",
+            file_path=video_clip.file_path,
+            source_media_start=video_clip.source_media_start,
+            source_media_end=video_clip.source_media_end,
+            track_id=1,
+            volume=video_clip.volume,
+            muted=video_clip.muted,
+            clip_type="detached_audio",
+            linked_clip_id=video_clip.clip_id,
+        )
+
+        video_clip.has_detached_audio = True
+        video_clip.muted = True
+        self._timeline_clips.append(audio_clip)
+        self.timeline_updated.emit()
+        return audio_clip
+
+    def detach_all_audio(self) -> List[TimelineClip]:
+        """Detach audio for all eligible video clips on timeline."""
+        targets = [c.clip_id for c in self._timeline_clips if not c.is_audio_only and not c.has_detached_audio]
+        created: List[TimelineClip] = []
+        for clip_id in targets:
+            c = self.detach_audio_from_clip(clip_id)
+            if c:
+                created.append(c)
+        return created
+
     def split_clip_at_position(self, clip_id: str, timeline_position: float) -> Optional[list[TimelineClip]]:
         """Split a clip at the given timeline position.
 
@@ -465,7 +554,13 @@ class EditorService(QObject):
             color=clip.color,
             file_path=clip.file_path,
             source_media_start=clip.source_media_start,
-            source_media_end=clip.source_media_end
+            source_media_end=clip.source_media_end,
+            track_id=clip.track_id,
+            volume=clip.volume,
+            muted=clip.muted,
+            clip_type=clip.clip_type,
+            linked_clip_id=clip.linked_clip_id,
+            has_detached_audio=clip.has_detached_audio,
         )
         self._update_clip_name(left_clip)
 
@@ -481,7 +576,13 @@ class EditorService(QObject):
             color=clip.color,
             file_path=clip.file_path,
             source_media_start=clip.source_media_start,
-            source_media_end=clip.source_media_end
+            source_media_end=clip.source_media_end,
+            track_id=clip.track_id,
+            volume=clip.volume,
+            muted=clip.muted,
+            clip_type=clip.clip_type,
+            linked_clip_id=clip.linked_clip_id,
+            has_detached_audio=clip.has_detached_audio,
         )
         self._update_clip_name(right_clip)
 

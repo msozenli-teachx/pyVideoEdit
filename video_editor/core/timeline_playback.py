@@ -82,6 +82,36 @@ class TimelinePlaybackEngine(QObject):
     
     # Constants
     TIMER_INTERVAL_MS = 16  # ~60fps for smooth playhead movement
+
+    def _should_play_clip_audio(self, clip: Optional[TimelineClip]) -> bool:
+        """Return True when video player's own audio should be audible."""
+        if clip is None:
+            return False
+        # If audio is detached from this video clip, keep the video player muted.
+        return not bool(getattr(clip, "has_detached_audio", False))
+
+    def _get_effective_clip_volume(self, clip: Optional[TimelineClip]) -> float:
+        """Get mute-aware clip volume in QMediaPlayer range [0.0, 1.0]."""
+        if clip is None:
+            return 0.0
+        if hasattr(clip, "get_effective_volume"):
+            try:
+                return max(0.0, min(1.0, float(clip.get_effective_volume())))
+            except Exception:
+                pass
+        muted = bool(getattr(clip, "muted", False))
+        base = float(getattr(clip, "volume", 1.0))
+        return 0.0 if muted else max(0.0, min(1.0, base))
+
+    def _set_output_volume(self, output: Optional[QAudioOutput], value: float):
+        """Safely set volume on an audio output."""
+        if output:
+            output.setVolume(max(0.0, min(1.0, value)))
+
+    def _mute_all_outputs(self):
+        """Mute both primary and detached audio outputs."""
+        self._set_output_volume(self._audio_output, 0.0)
+        self._set_output_volume(self._detached_audio_output, 0.0)
     
     def __init__(self, parent: Optional[QObject] = None):
         super().__init__(parent)
@@ -101,6 +131,8 @@ class TimelinePlaybackEngine(QObject):
         # Media player references (managed externally)
         self._media_player: Optional[QMediaPlayer] = None
         self._audio_output: Optional[QAudioOutput] = None
+        self._detached_audio_player: Optional[QMediaPlayer] = None
+        self._detached_audio_output: Optional[QAudioOutput] = None
         self._video_widget: Optional[QWidget] = None
         self._black_screen: Optional[QWidget] = None
         
@@ -114,6 +146,7 @@ class TimelinePlaybackEngine(QObject):
         
         # Clip sync tracking
         self._last_loaded_clip_id: Optional[str] = None
+        self._last_detached_audio_clip_id: Optional[str] = None
         
         # Callbacks
         self._on_clip_load_callback: Optional[Callable] = None
@@ -121,8 +154,15 @@ class TimelinePlaybackEngine(QObject):
         
         logger.info("TimelinePlaybackEngine initialized with master timer")
     
-    def set_media_player(self, player: QMediaPlayer, audio_output: QAudioOutput,
-                         video_widget: QWidget, black_screen: QWidget):
+    def set_media_player(
+        self,
+        player: QMediaPlayer,
+        audio_output: QAudioOutput,
+        video_widget: QWidget,
+        black_screen: QWidget,
+        detached_audio_player: Optional[QMediaPlayer] = None,
+        detached_audio_output: Optional[QAudioOutput] = None,
+    ):
         """Set the media player components for playback.
         
         Args:
@@ -130,9 +170,13 @@ class TimelinePlaybackEngine(QObject):
             audio_output: QAudioOutput instance
             video_widget: Widget for video display
             black_screen: Widget for gap display (black screen)
+            detached_audio_player: Optional player for detached audio clips
+            detached_audio_output: Optional audio output for detached audio clips
         """
         self._media_player = player
         self._audio_output = audio_output
+        self._detached_audio_player = detached_audio_player
+        self._detached_audio_output = detached_audio_output
         self._video_widget = video_widget
         self._black_screen = black_screen
         
@@ -167,19 +211,24 @@ class TimelinePlaybackEngine(QObject):
         self._current_segment_index = -1
         self._current_segment = None
         self._last_loaded_clip_id = None
+        self._last_detached_audio_clip_id = None
         
         logger.info(f"Timeline set with {len(self._clips)} clips, {len(self._segments)} segments, duration: {self._duration:.2f}s")
     
     def _build_segments(self):
         """Build playback segments from clips, including gaps."""
         self._segments.clear()
-        
-        if not self._clips:
+
+        # Audio-only clips are handled by detached audio sync and should not
+        # influence video segment transitions.
+        video_clips = [c for c in self._clips if not getattr(c, "is_audio_only", False)]
+
+        if not video_clips:
             return
         
         current_time = 0.0
-        
-        for clip in self._clips:
+
+        for clip in video_clips:
             # Check for gap before this clip
             if clip.timeline_start > current_time + 0.001:  # Small tolerance for floating point
                 gap_duration = clip.timeline_start - current_time
@@ -209,10 +258,11 @@ class TimelinePlaybackEngine(QObject):
     
     def _calculate_duration(self):
         """Calculate total timeline duration."""
-        if self._segments:
-            self._duration = self._segments[-1].timeline_end
-        else:
-            self._duration = 0.0
+        segment_duration = self._segments[-1].timeline_end if self._segments else 0.0
+        clips_duration = 0.0
+        if self._clips:
+            clips_duration = max((c.timeline_start + c.duration) for c in self._clips)
+        self._duration = max(segment_duration, clips_duration)
     
     def get_segment_at_position(self, position: float) -> Optional[PlaybackSegment]:
         """Get the segment at a given timeline position.
@@ -234,7 +284,7 @@ class TimelinePlaybackEngine(QObject):
         Args:
             start_position: Position to start from (uses current position if None)
         """
-        if not self._segments:
+        if self._duration <= 0:
             logger.warning("No segments to play")
             return
         
@@ -257,7 +307,14 @@ class TimelinePlaybackEngine(QObject):
         self._master_timer.start()
         
         # Update segment and sync media player
-        self._update_current_segment()
+        try:
+            self._update_current_segment()
+            self._sync_detached_audio()
+        except Exception as e:
+            logger.exception("Playback start sync failed")
+            self.error_occurred.emit(str(e))
+            self.stop()
+            return
         
         logger.info(f"Playback started at position {self._position:.2f}s (duration: {self._duration:.2f}s)")
     
@@ -279,9 +336,7 @@ class TimelinePlaybackEngine(QObject):
         if self._media_player:
             self._media_player.pause()
 
-        # Mute audio output to ensure no audio bleed
-        if self._audio_output:
-            self._audio_output.setVolume(0.0)
+        self._mute_all_outputs()
 
         # If we're in a clip segment, ensure we stay at the current position
         # by syncing the media player one last time
@@ -291,6 +346,8 @@ class TimelinePlaybackEngine(QObject):
             if self._media_player:
                 self._media_player.setPosition(int(source_position * 1000))
 
+        if self._detached_audio_player:
+            self._detached_audio_player.pause()
         logger.info(f"Playback paused at position {self._position:.2f}s")
     
     def resume(self):
@@ -315,12 +372,16 @@ class TimelinePlaybackEngine(QObject):
         if self._media_player and self._current_segment and not self._current_segment.is_gap:
             # Ensure audio volume is restored
             if self._audio_output:
-                self._audio_output.setVolume(1.0)
+                if self._should_play_clip_audio(self._current_segment.clip):
+                    self._audio_output.setVolume(self._get_effective_clip_volume(self._current_segment.clip))
+                else:
+                    self._audio_output.setVolume(0.0)
             self._media_player.play()
         else:
             # If we're in a gap, keep audio muted
-            if self._audio_output:
-                self._audio_output.setVolume(0.0)
+            self._set_output_volume(self._audio_output, 0.0)
+
+        self._sync_detached_audio()
 
         logger.info(f"Playback resumed at position {self._position:.2f}s")
     
@@ -342,9 +403,9 @@ class TimelinePlaybackEngine(QObject):
             # Explicitly pause to ensure no async audio continues
             self._media_player.pause()
 
-        # Mute audio output immediately
-        if self._audio_output:
-            self._audio_output.setVolume(0.0)
+        self._stop_detached_audio_player()
+
+        self._mute_all_outputs()
 
         # Clear the video output to avoid stale frames
         if self._video_widget:
@@ -357,6 +418,7 @@ class TimelinePlaybackEngine(QObject):
         self._current_segment_index = -1
         self._current_segment = None
         self._last_loaded_clip_id = None
+        self._last_detached_audio_clip_id = None
 
         self.position_changed.emit(self._position)
         logger.info("Playback stopped, buffers cleared, and playhead reset to start")
@@ -386,6 +448,7 @@ class TimelinePlaybackEngine(QObject):
 
         # Update segment and sync media player
         self._update_current_segment()
+        self._sync_detached_audio()
 
         # Restore correct state
         if was_playing:
@@ -431,6 +494,8 @@ class TimelinePlaybackEngine(QObject):
             self._last_loaded_clip_id = None  # Force reload for clean start
             self._update_current_segment()
 
+        self._sync_detached_audio()
+
         # Preserve playback state
         if was_playing:
             self._set_state(PlaybackState.PLAYING)
@@ -462,45 +527,54 @@ class TimelinePlaybackEngine(QObject):
         """Master timer tick - drives the playhead independently."""
         if self._state != PlaybackState.PLAYING:
             return
+
+        try:
         
-        # Calculate elapsed time since last tick
-        current_time = time.time()
-        elapsed = (current_time - self._last_tick_time) * self._playback_rate
-        self._last_tick_time = current_time
+            # Calculate elapsed time since last tick
+            current_time = time.time()
+            elapsed = (current_time - self._last_tick_time) * self._playback_rate
+            self._last_tick_time = current_time
         
-        # Update position
-        self._position += elapsed
+            # Update position
+            self._position += elapsed
         
-        # Check if we've reached the end of the timeline
-        if self._position >= self._duration:
-            self._position = self._duration
-            self._on_timeline_finished()
-            return
-        
-        # CRITICAL FIX: Check if we're in a clip and have exceeded its trimmed end time
-        # This must happen BEFORE _update_current_segment to catch boundary violations early
-        if self._current_segment and not self._current_segment.is_gap:
-            segment_end = self._current_segment.timeline_end
-            if self._position >= segment_end:
-                # We've reached the end of this clip - stop media player immediately!
-                logger.debug(f"TIMER ENFORCEMENT: Position {self._position:.3f}s >= segment end {segment_end:.3f}s")
-                self._position = segment_end
-                # Stop media player immediately
-                if self._media_player:
-                    self._media_player.pause()
-                if self._audio_output:
-                    self._audio_output.setVolume(0.0)
-                # Transition to next segment
-                self._transition_to_next_segment()
-                # Emit position change
-                self.position_changed.emit(self._position)
+            # Check if we've reached the end of the timeline
+            if self._position >= self._duration:
+                self._position = self._duration
+                self._on_timeline_finished()
                 return
         
-        # Update current segment and sync media player
-        self._update_current_segment()
+            # CRITICAL FIX: Check if we're in a clip and have exceeded its trimmed end time
+            # This must happen BEFORE _update_current_segment to catch boundary violations early
+            if self._current_segment and not self._current_segment.is_gap:
+                segment_end = self._current_segment.timeline_end
+                if self._position >= segment_end:
+                    # We've reached the end of this clip - stop media player immediately!
+                    logger.debug(f"TIMER ENFORCEMENT: Position {self._position:.3f}s >= segment end {segment_end:.3f}s")
+                    self._position = segment_end
+                    # Stop media player immediately
+                    if self._media_player:
+                        self._media_player.pause()
+                    self._set_output_volume(self._audio_output, 0.0)
+                    if self._detached_audio_player:
+                        self._detached_audio_player.pause()
+                    self._set_output_volume(self._detached_audio_output, 0.0)
+                    # Transition to next segment
+                    self._transition_to_next_segment()
+                    # Emit position change
+                    self.position_changed.emit(self._position)
+                    return
         
-        # Emit position change
-        self.position_changed.emit(self._position)
+            # Update current segment and sync media player
+            self._update_current_segment()
+            self._sync_detached_audio()
+        
+            # Emit position change
+            self.position_changed.emit(self._position)
+        except Exception as e:
+            logger.exception("Master timer tick failed")
+            self.error_occurred.emit(str(e))
+            self.stop()
     
     def _update_current_segment(self):
         """Update the current segment based on position and sync media player."""
@@ -524,6 +598,7 @@ class TimelinePlaybackEngine(QObject):
                     self._current_segment_index = -1
                     self._current_segment = None
                     self._display_gap_state()
+                    self._sync_detached_audio()
                 return
         
         # Check if segment changed
@@ -543,10 +618,14 @@ class TimelinePlaybackEngine(QObject):
 
         # Ensure audio volume matches current state after segment updates
         if self._audio_output:
-            if self._state == PlaybackState.PLAYING and not segment.is_gap:
-                self._audio_output.setVolume(1.0)
+            if (
+                self._state == PlaybackState.PLAYING
+                and not segment.is_gap
+                and self._should_play_clip_audio(segment.clip)
+            ):
+                self._set_output_volume(self._audio_output, self._get_effective_clip_volume(segment.clip))
             else:
-                self._audio_output.setVolume(0.0)
+                self._set_output_volume(self._audio_output, 0.0)
     
     def _handle_gap_segment(self, segment: PlaybackSegment, segment_changed: bool = False):
         """Handle being in a gap segment.
@@ -646,11 +725,12 @@ class TimelinePlaybackEngine(QObject):
 
         # Handle audio volume based on state
         if self._audio_output:
-            if self._state == PlaybackState.PLAYING:
-                self._audio_output.setVolume(1.0)
+            if self._state == PlaybackState.PLAYING and self._should_play_clip_audio(clip):
+                self._set_output_volume(self._audio_output, self._get_effective_clip_volume(clip))
             else:
                 # Paused or stopped - mute audio
-                self._audio_output.setVolume(0.0)
+                self._set_output_volume(self._audio_output, 0.0)
+
 
     def _transition_to_next_segment(self):
         """Transition from current clip to the next segment (gap or next clip).
@@ -659,7 +739,17 @@ class TimelinePlaybackEngine(QObject):
         and properly initializing the next segment.
         """
         if self._current_segment_index < 0 or self._current_segment_index >= len(self._segments) - 1:
-            # No more segments - we're at the end
+            # No more video segments. If timeline duration is longer (e.g. detached
+            # audio tail), continue in implicit-gap state until real timeline end.
+            if self._position < self._duration - 0.01:
+                self._current_segment = None
+                self._current_segment_index = -1
+                self._last_loaded_clip_id = None
+                self._display_gap_state()
+                self.position_changed.emit(self._position)
+                return
+
+            # No remaining media to play.
             self._on_timeline_finished()
             return
 
@@ -689,6 +779,8 @@ class TimelinePlaybackEngine(QObject):
             self._current_segment = next_segment
             self._last_loaded_clip_id = None
             self._handle_clip_segment(next_segment, True)
+
+        self._sync_detached_audio()
 
         self.position_changed.emit(self._position)
     
@@ -737,8 +829,92 @@ class TimelinePlaybackEngine(QObject):
         self._media_player.pause()
 
         # Mute audio output
-        if self._audio_output:
-            self._audio_output.setVolume(0.0)
+        self._mute_all_outputs()
+
+    def _stop_detached_audio_player(self):
+        """Stop detached audio playback and mute output."""
+        if self._detached_audio_player:
+            self._detached_audio_player.stop()
+            self._detached_audio_player.pause()
+        if self._detached_audio_output:
+            self._detached_audio_output.setVolume(0.0)
+
+    def _get_detached_audio_clip_at_position(self) -> Optional[TimelineClip]:
+        """Return detached/audio-only clip active at current timeline position."""
+        epsilon = 1e-6
+        for clip in self._clips:
+            if not getattr(clip, "is_audio_only", False):
+                continue
+            clip_start = clip.timeline_start
+            clip_end = clip.timeline_start + clip.duration
+            if clip_start <= self._position + epsilon and self._position < clip_end - epsilon:
+                return clip
+        return None
+
+    def _sync_detached_audio(self):
+        """Synchronize detached audio player to timeline position."""
+        if not self._detached_audio_player:
+            return
+
+        try:
+
+            audio_clip = self._get_detached_audio_clip_at_position()
+            if not audio_clip:
+                self._last_detached_audio_clip_id = None
+                if self._detached_audio_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+                    self._detached_audio_player.pause()
+                if self._detached_audio_output:
+                    self._detached_audio_output.setVolume(0.0)
+                return
+
+            media_path = getattr(audio_clip, "file_path", "")
+            if not media_path:
+                return
+
+            from PyQt6.QtCore import QUrl
+
+            source = QUrl.fromLocalFile(str(media_path))
+            if self._detached_audio_player.source() != source:
+                self._detached_audio_player.setSource(source)
+                self._last_detached_audio_clip_id = audio_clip.clip_id
+
+            offset_in_clip = self._position - audio_clip.timeline_start
+            source_position = audio_clip.start_time + offset_in_clip
+            source_position = max(audio_clip.start_time, min(source_position, max(audio_clip.start_time, audio_clip.end_time - 0.01)))
+            target_ms = int(source_position * 1000)
+
+            if abs(self._detached_audio_player.position() - target_ms) > 120:
+                self._detached_audio_player.setPosition(target_ms)
+
+            if self._state == PlaybackState.PLAYING:
+                if self._detached_audio_output:
+                    self._detached_audio_output.setVolume(self._get_effective_clip_volume(audio_clip))
+                if self._detached_audio_player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+                    self._detached_audio_player.play()
+            else:
+                if self._detached_audio_output:
+                    self._detached_audio_output.setVolume(0.0)
+                if self._detached_audio_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+                    self._detached_audio_player.pause()
+        except Exception as e:
+            logger.exception("Detached audio sync failed")
+            self.error_occurred.emit(str(e))
+            self._stop_detached_audio_player()
+
+    def update_current_clip_volume(self):
+        """Apply current clip and detached audio clip volume/mute values immediately."""
+        if self._state == PlaybackState.STOPPED:
+            return
+
+        if self._current_segment and not self._current_segment.is_gap and self._audio_output:
+            clip = self._current_segment.clip
+            if self._state == PlaybackState.PLAYING and self._should_play_clip_audio(clip):
+                self._audio_output.setVolume(self._get_effective_clip_volume(clip))
+            else:
+                self._audio_output.setVolume(0.0)
+
+        # Detached path uses timeline-position lookup.
+        self._sync_detached_audio()
     
     def _on_timeline_finished(self):
         """Called when playback reaches the end of the timeline."""
@@ -750,6 +926,8 @@ class TimelinePlaybackEngine(QObject):
         # Stop media player completely
         if self._media_player:
             self._media_player.stop()
+
+        self._stop_detached_audio_player()
 
         # Mute audio
         if self._audio_output:
@@ -766,6 +944,7 @@ class TimelinePlaybackEngine(QObject):
 
         # Reset tracking
         self._last_loaded_clip_id = None
+        self._last_detached_audio_clip_id = None
         self._current_segment = None
         self._current_segment_index = -1
 
@@ -839,4 +1018,5 @@ class TimelinePlaybackEngine(QObject):
         self._duration = 0.0
         self._position = 0.0
         self._last_loaded_clip_id = None
+        self._last_detached_audio_clip_id = None
         logger.info("Timeline cleared")
