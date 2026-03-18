@@ -188,6 +188,7 @@ class MainWindow(QMainWindow):
         self.timeline.split_requested.connect(self._on_split_requested)
         self.timeline.clip_volume_changed.connect(self._on_clip_volume_changed)
         self.timeline.clip_mute_toggled.connect(self._on_clip_mute_toggled)
+        self.timeline.clip_fade_changed.connect(self._on_clip_fade_changed)
         self.timeline.detach_audio_requested.connect(self._on_detach_audio_requested)
         
         # Editor service signals
@@ -608,6 +609,19 @@ class MainWindow(QMainWindow):
 
         if hasattr(self.preview, "update_current_clip_volume"):
             self.preview.update_current_clip_volume()
+
+    def _on_clip_fade_changed(self, clip_id: str, fade_in: float, fade_out: float):
+        """Handle timeline clip fade changes."""
+        clip = self._editor_service.get_clip_by_id(clip_id)
+        if not clip:
+            return
+
+        clip.set_fade_in(fade_in)
+        clip.set_fade_out(fade_out)
+        self._editor_service.timeline_updated.emit()
+
+        if hasattr(self.preview, "refresh_timeline_model"):
+            self._refresh_preview_timeline_model()
 
     def _on_clip_trimmed(self, clip_id: str, new_start: float, new_end: float):
         """Handle clip trim update from timeline."""

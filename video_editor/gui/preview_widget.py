@@ -10,8 +10,8 @@ from PyQt6.QtWidgets import (
     QSlider, QFrame, QSizePolicy, QLineEdit, QGroupBox
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QUrl
-from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoFrame
-from PyQt6.QtMultimediaWidgets import QVideoWidget
+from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoFrame, QVideoSink
+from PyQt6.QtGui import QPainter, QImage, QBrush, QColor
 from typing import Optional, List
 import os
 
@@ -21,6 +21,114 @@ from video_editor.utils.logging_config import get_logger
 
 
 logger = get_logger("preview_widget")
+
+
+class CustomVideoWidget(QWidget):
+    """Custom video widget that uses QVideoSink for frame-level opacity control.
+    
+    This widget receives video frames via QVideoSink and applies fade effects
+    by adjusting the opacity of rendered frames. QVideoWidget doesn't support
+    opacity changes, so this custom implementation is required for fade in/out.
+    """
+    
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        
+        # Video sink for receiving frames
+        self._video_sink = QVideoSink(self)
+        self._video_sink.videoFrameChanged.connect(self._on_video_frame_changed)
+        
+        # Current frame and fade state
+        self._current_frame: Optional[QVideoFrame] = None
+        self._current_image: Optional[QImage] = None
+        self._fade_percentage: float = 1.0  # 0.0 = dark, 1.0 = fully visible
+        
+        # Set background to black
+        self.setStyleSheet("background-color: black;")
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+    
+    def videoSink(self) -> QVideoSink:
+        """Return the video sink for this widget."""
+        return self._video_sink
+    
+    def set_fade_percentage(self, percentage: float):
+        """Set the fade percentage for rendering.
+        
+        Args:
+            percentage: 0.0 = fully dark, 1.0 = fully visible
+        """
+        percentage = max(0.0, min(1.0, percentage))
+        if self._fade_percentage != percentage:
+            self._fade_percentage = percentage
+            self.update()  # Trigger repaint
+    
+    def get_fade_percentage(self) -> float:
+        """Get the current fade percentage."""
+        return self._fade_percentage
+    
+    def _on_video_frame_changed(self, frame: QVideoFrame):
+        """Handle incoming video frame from the sink."""
+        if frame is None or not frame.isValid():
+            return
+        
+        try:
+            # Store the frame and trigger repaint
+            self._current_frame = frame
+            # Convert frame to image for rendering
+            self._current_image = frame.toImage()
+            self.update()
+        except Exception as e:
+            logger.warning(f"Failed to process video frame: {e}")
+    
+    def paintEvent(self, event):
+        """Paint the current video frame with fade effect."""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        
+        if self._current_image is not None and not self._current_image.isNull():
+            # Calculate scaling to maintain aspect ratio
+            widget_rect = self.rect()
+            image_size = self._current_image.size()
+            
+            # Calculate scaled size maintaining aspect ratio
+            widget_aspect = widget_rect.width() / widget_rect.height() if widget_rect.height() > 0 else 1.0
+            image_aspect = image_size.width() / image_size.height() if image_size.height() > 0 else 1.0
+            
+            if widget_aspect > image_aspect:
+                # Widget is wider, scale to height
+                scaled_height = widget_rect.height()
+                scaled_width = int(scaled_height * image_aspect)
+            else:
+                # Widget is taller, scale to width
+                scaled_width = widget_rect.width()
+                scaled_height = int(scaled_width / image_aspect)
+            
+            # Center the image
+            x = (widget_rect.width() - scaled_width) // 2
+            y = (widget_rect.height() - scaled_height) // 2
+            
+            # Apply fade opacity
+            painter.setOpacity(self._fade_percentage)
+            
+            # Draw the scaled image
+            scaled_image = self._current_image.scaled(
+                scaled_width, scaled_height,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            )
+            painter.drawImage(x, y, scaled_image)
+        else:
+            # No frame available, draw black background
+            painter.fillRect(self.rect(), QBrush(QColor(0, 0, 0)))
+        
+        painter.end()
+    
+    def clear_frame(self):
+        """Clear the current frame and show black."""
+        self._current_frame = None
+        self._current_image = None
+        self._fade_percentage = 1.0
+        self.update()
 
 
 class PreviewWidget(QWidget):
@@ -77,6 +185,7 @@ class PreviewWidget(QWidget):
         self._timeline_playback_engine.gap_ended.connect(self._on_gap_ended)
         self._timeline_playback_engine.playback_finished.connect(self._on_timeline_finished)
         self._timeline_playback_engine.error_occurred.connect(self._on_playback_error)
+        self._timeline_playback_engine.video_fade_changed.connect(self.apply_video_fade)
         
         # Set callbacks
         self._timeline_playback_engine.set_callbacks(
@@ -125,6 +234,7 @@ class PreviewWidget(QWidget):
         self.preview_container.setFrameShape(QFrame.Shape.StyledPanel)
         self.preview_container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.preview_container.setMinimumSize(320, 180)
+        self.preview_container.setStyleSheet("background-color: black;")
         
         preview_layout = QVBoxLayout(self.preview_container)
         preview_layout.setContentsMargins(0, 0, 0, 0)
@@ -136,8 +246,8 @@ class PreviewWidget(QWidget):
         self.placeholder_label.setObjectName("timeLabel")
         preview_layout.addWidget(self.placeholder_label)
         
-        # Video widget (hidden initially)
-        self.video_widget = QVideoWidget()
+        # Video widget (hidden initially) - using custom widget for fade support
+        self.video_widget = CustomVideoWidget()
         self.video_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.video_widget.hide()
         preview_layout.addWidget(self.video_widget)
@@ -287,10 +397,10 @@ class PreviewWidget(QWidget):
         self._detached_audio_player = QMediaPlayer()
         self._detached_audio_player.setAudioOutput(self._detached_audio_output)
         
-        # Create media player
+        # Create media player - use custom video widget's sink for fade support
         self._media_player = QMediaPlayer()
         self._media_player.setAudioOutput(self._audio_output)
-        self._media_player.setVideoOutput(self.video_widget)
+        self._media_player.setVideoSink(self.video_widget.videoSink())
         
         # Connect media player signals
         self._media_player.playbackStateChanged.connect(self._on_playback_state_changed)
@@ -379,6 +489,8 @@ class PreviewWidget(QWidget):
         self.placeholder_label.setText("No video loaded\n\nSelect a media file from the pool")
         self.placeholder_label.show()
         self.video_widget.hide()
+        if isinstance(self.video_widget, CustomVideoWidget):
+            self.video_widget.clear_frame()
         
         self.start_time_input.setText("00:00:00")
         self.end_time_input.setText("00:00:00")
@@ -507,6 +619,8 @@ class PreviewWidget(QWidget):
 
         self._black_screen.show()
         self.video_widget.hide()
+        if isinstance(self.video_widget, CustomVideoWidget):
+            self.video_widget.clear_frame()
 
         if media_label is not None:
             self.media_label.setText(media_label)
@@ -780,6 +894,8 @@ class PreviewWidget(QWidget):
         self.placeholder_label.setText(f"Playback error:\n{error_message}")
         self.placeholder_label.show()
         self.video_widget.hide()
+        if isinstance(self.video_widget, CustomVideoWidget):
+            self.video_widget.clear_frame()
     
     def _load_and_play_clip_segment(self, clip: TimelineClip, source_position: float):
         """Load and play a specific clip segment.
@@ -960,16 +1076,9 @@ class PreviewWidget(QWidget):
 
         # Hide video widget and show black screen
         self.video_widget.hide()
+        if isinstance(self.video_widget, CustomVideoWidget):
+            self.video_widget.clear_frame()
         self._black_screen.show()
-
-        # Clear any stale frame in sink so previous clip frame cannot flash on reveal.
-        try:
-            sink = self.video_widget.videoSink()
-            if sink is not None:
-                sink.setVideoFrame(QVideoFrame())
-        except Exception:
-            # Backend may not expose sink operations consistently; safe to ignore.
-            pass
 
         # Mute audio to ensure no sound
         if self._audio_output:
@@ -1052,6 +1161,28 @@ class PreviewWidget(QWidget):
         if self._timeline_playback_engine:
             self._timeline_playback_engine.update_current_clip_volume()
     
+    def apply_video_fade(self, fade_percentage: float):
+        """Apply video fade effect based on fade percentage.
+        
+        Uses the custom video widget's frame opacity control for proper fade in/out.
+        When the playhead enters a fade zone, the video opacity gradually changes.
+        
+        Args:
+            fade_percentage: 0.0 = fully dark, 1.0 = fully visible (normal)
+        """
+        if not hasattr(self, 'video_widget') or not isinstance(self.video_widget, CustomVideoWidget):
+            return
+        
+        # Clamp percentage
+        fade_percentage = max(0.0, min(1.0, fade_percentage))
+        
+        # Apply fade to the custom video widget
+        if self.video_widget.isVisible():
+            self.video_widget.set_fade_percentage(fade_percentage)
+        else:
+            # Reset fade when video is hidden
+            self.video_widget.set_fade_percentage(1.0)
+    
     def seek_timeline(self, position: float):
         """Seek to a position in the timeline.
 
@@ -1088,8 +1219,11 @@ class PreviewWidget(QWidget):
             self._display_gap_screen()
         else:
             # In a clip: show video widget, hide black screen
-            self.video_widget.show()
             self._black_screen.hide()
+            self.video_widget.show()
+            # Reset fade percentage when showing video
+            if isinstance(self.video_widget, CustomVideoWidget):
+                self.video_widget.set_fade_percentage(1.0)
 
             # Only restore audio volume if playing, otherwise keep muted
             if self._audio_output:

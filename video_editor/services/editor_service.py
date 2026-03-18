@@ -58,6 +58,8 @@ class TimelineClip:
     clip_type: str = "video"  # "video", "audio", "detached_audio"
     linked_clip_id: Optional[str] = None
     has_detached_audio: bool = False
+    fade_in_duration: float = 0.0  # Fade in duration in seconds (from start of clip)
+    fade_out_duration: float = 0.0  # Fade out duration in seconds (from end of clip)
     
     def __post_init__(self):
         """Initialize source media bounds if not set."""
@@ -74,6 +76,61 @@ class TimelineClip:
     def get_effective_volume(self) -> float:
         """Effective volume (mute-aware)."""
         return 0.0 if self.muted else self.volume
+
+    def set_fade_in(self, duration: float) -> None:
+        """Set fade in duration, clamped to clip duration and respecting fade out."""
+        duration = max(0.0, min(duration, max(0.0, self.duration - self.fade_out_duration)))
+        self.fade_in_duration = duration
+
+    def set_fade_out(self, duration: float) -> None:
+        """Set fade out duration, clamped to clip duration and respecting fade in."""
+        duration = max(0.0, min(duration, max(0.0, self.duration - self.fade_in_duration)))
+        self.fade_out_duration = duration
+
+    def clamp_fade_durations(self) -> None:
+        """Clamp fade durations to not exceed clip duration."""
+        max_total = max(0.0, self.duration)
+        # First, ensure individual fades don't exceed duration
+        self.fade_in_duration = max(0.0, min(self.fade_in_duration, max_total))
+        self.fade_out_duration = max(0.0, min(self.fade_out_duration, max_total))
+        # Then ensure they don't overlap
+        if self.fade_in_duration + self.fade_out_duration > max_total:
+            # Scale both proportionally
+            ratio = max_total / (self.fade_in_duration + self.fade_out_duration)
+            self.fade_in_duration *= ratio
+            self.fade_out_duration *= ratio
+
+    def get_volume_at_position(self, position_in_clip: float) -> float:
+        """Get the effective volume at a position within the clip (0.0 to 1.0 relative).
+
+        Args:
+            position_in_clip: Position in seconds within the clip (0 to duration)
+
+        Returns:
+            Volume multiplier (0.0 to 1.0)
+        """
+        if self.muted:
+            return 0.0
+
+        base_volume = self.volume
+
+        # Calculate fade in multiplier
+        if self.fade_in_duration > 0 and position_in_clip < self.fade_in_duration:
+            fade_in_multiplier = position_in_clip / self.fade_in_duration
+        else:
+            fade_in_multiplier = 1.0
+
+        # Calculate fade out multiplier
+        if self.fade_out_duration > 0:
+            fade_out_start = self.duration - self.fade_out_duration
+            if position_in_clip > fade_out_start:
+                fade_out_multiplier = (self.duration - position_in_clip) / self.fade_out_duration
+            else:
+                fade_out_multiplier = 1.0
+        else:
+            fade_out_multiplier = 1.0
+
+        return base_volume * fade_in_multiplier * fade_out_multiplier
 
 
 @dataclass

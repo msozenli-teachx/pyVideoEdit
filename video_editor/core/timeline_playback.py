@@ -79,6 +79,7 @@ class TimelinePlaybackEngine(QObject):
     gap_ended = pyqtSignal()
     playback_finished = pyqtSignal()
     error_occurred = pyqtSignal(str)  # Error message
+    video_fade_changed = pyqtSignal(float)  # Fade percentage (0.0 = dark, 1.0 = normal)
     
     # Constants
     TIMER_INTERVAL_MS = 16  # ~60fps for smooth playhead movement
@@ -105,6 +106,92 @@ class TimelinePlaybackEngine(QObject):
         muted = bool(getattr(clip, "muted", False))
         base = float(getattr(clip, "volume", 1.0))
         return 0.0 if muted else max(0.0, min(1.0, base))
+
+    def _get_effective_clip_volume_at_position(self, clip: Optional[TimelineClip], position_in_clip: float) -> float:
+        """Get fade-aware clip volume at a specific position within the clip."""
+        if clip is None:
+            return 0.0
+
+        duration = float(getattr(clip, "duration", 0.0))
+        if duration <= 0:
+            return 0.0
+
+        position_in_clip = max(0.0, min(position_in_clip, duration))
+
+        if hasattr(clip, "get_volume_at_position"):
+            try:
+                volume = float(clip.get_volume_at_position(position_in_clip))
+                return max(0.0, min(1.0, volume))
+            except Exception:
+                pass
+
+        return self._get_effective_clip_volume(clip)
+
+    def _apply_current_fade_volume(self):
+        """Apply fade-aware volume for the current timeline position."""
+        if not self._audio_output:
+            return
+
+        if (
+            self._state == PlaybackState.PLAYING
+            and self._current_segment
+            and not self._current_segment.is_gap
+            and self._should_play_clip_audio(self._current_segment.clip)
+        ):
+            position_in_clip = self._position - self._current_segment.timeline_start
+            volume = self._get_effective_clip_volume_at_position(self._current_segment.clip, position_in_clip)
+            self._set_output_volume(self._audio_output, volume)
+        else:
+            self._set_output_volume(self._audio_output, 0.0)
+
+    def _get_video_fade_percentage(self, clip: Optional[TimelineClip], position_in_clip: float) -> float:
+        """Calculate video fade percentage based on clip fade settings.
+        
+        Returns:
+            0.0 = fully dark, 1.0 = fully visible (normal)
+        """
+        if clip is None:
+            return 1.0
+
+        duration = float(getattr(clip, "duration", 0.0))
+        if duration <= 0:
+            return 1.0
+
+        position_in_clip = max(0.0, min(position_in_clip, duration))
+
+        fade_in = float(getattr(clip, "fade_in_duration", 0.0))
+        fade_out = float(getattr(clip, "fade_out_duration", 0.0))
+
+        # Check fade in zone
+        if fade_in > 0 and position_in_clip < fade_in:
+            # Linear fade in: 0% at start to 100% at fade_in_duration
+            return position_in_clip / fade_in
+
+        # Check fade out zone
+        if fade_out > 0:
+            fade_out_start = duration - fade_out
+            if position_in_clip > fade_out_start:
+                # Linear fade out: 100% at fade_out_start to 0% at end
+                remaining = duration - position_in_clip
+                return remaining / fade_out
+
+        # Normal playback (not in fade zone)
+        return 1.0
+
+    def _apply_video_fade(self):
+        """Apply video fade overlay based on current playhead position."""
+        if not self._current_segment or self._current_segment.is_gap:
+            self.video_fade_changed.emit(1.0)
+            return
+
+        clip = self._current_segment.clip
+        if not clip:
+            self.video_fade_changed.emit(1.0)
+            return
+
+        position_in_clip = self._position - self._current_segment.timeline_start
+        fade_percentage = self._get_video_fade_percentage(clip, position_in_clip)
+        self.video_fade_changed.emit(fade_percentage)
 
     def _set_output_volume(self, output: Optional[QAudioOutput], value: float):
         """Safely set volume on an audio output."""
@@ -377,7 +464,10 @@ class TimelinePlaybackEngine(QObject):
             # Ensure audio volume is restored
             if self._audio_output:
                 if self._should_play_clip_audio(self._current_segment.clip):
-                    self._audio_output.setVolume(self._get_effective_clip_volume(self._current_segment.clip))
+                    self._audio_output.setVolume(self._get_effective_clip_volume_at_position(
+                        self._current_segment.clip,
+                        self._position - self._current_segment.timeline_start
+                    ))
                 else:
                     self._audio_output.setVolume(0.0)
             self._media_player.play()
@@ -572,6 +662,8 @@ class TimelinePlaybackEngine(QObject):
             # Update current segment and sync media player
             self._update_current_segment()
             self._sync_detached_audio()
+            self._apply_current_fade_volume()
+            self._apply_video_fade()
         
             # Emit position change
             self.position_changed.emit(self._position)
@@ -621,15 +713,7 @@ class TimelinePlaybackEngine(QObject):
             self._handle_clip_segment(segment, segment_changed)
 
         # Ensure audio volume matches current state after segment updates
-        if self._audio_output:
-            if (
-                self._state == PlaybackState.PLAYING
-                and not segment.is_gap
-                and self._should_play_clip_audio(segment.clip)
-            ):
-                self._set_output_volume(self._audio_output, self._get_effective_clip_volume(segment.clip))
-            else:
-                self._set_output_volume(self._audio_output, 0.0)
+        self._apply_current_fade_volume()
     
     def _handle_gap_segment(self, segment: PlaybackSegment, segment_changed: bool = False):
         """Handle being in a gap segment.
@@ -728,12 +812,7 @@ class TimelinePlaybackEngine(QObject):
             self._sync_media_player_position(source_position)
 
         # Handle audio volume based on state
-        if self._audio_output:
-            if self._state == PlaybackState.PLAYING and self._should_play_clip_audio(clip):
-                self._set_output_volume(self._audio_output, self._get_effective_clip_volume(clip))
-            else:
-                # Paused or stopped - mute audio
-                self._set_output_volume(self._audio_output, 0.0)
+        self._apply_current_fade_volume()
 
 
     def _transition_to_next_segment(self):
@@ -902,7 +981,10 @@ class TimelinePlaybackEngine(QObject):
 
             if self._state == PlaybackState.PLAYING:
                 if self._detached_audio_output:
-                    self._detached_audio_output.setVolume(self._get_effective_clip_volume(audio_clip))
+                    position_in_clip = self._position - audio_clip.timeline_start
+                    self._detached_audio_output.setVolume(
+                        self._get_effective_clip_volume_at_position(audio_clip, position_in_clip)
+                    )
                 if self._detached_audio_player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
                     self._detached_audio_player.play()
             else:
@@ -923,7 +1005,8 @@ class TimelinePlaybackEngine(QObject):
         if self._current_segment and not self._current_segment.is_gap and self._audio_output:
             clip = self._current_segment.clip
             if self._state == PlaybackState.PLAYING and self._should_play_clip_audio(clip):
-                self._audio_output.setVolume(self._get_effective_clip_volume(clip))
+                position_in_clip = self._position - self._current_segment.timeline_start
+                self._audio_output.setVolume(self._get_effective_clip_volume_at_position(clip, position_in_clip))
             else:
                 self._audio_output.setVolume(0.0)
 

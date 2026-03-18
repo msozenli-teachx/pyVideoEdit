@@ -135,6 +135,11 @@ class TimelineTrack(QWidget):
     playhead_moved = pyqtSignal(float)   # new_position in seconds
     clip_volume_changed = pyqtSignal(str, float)  # clip_id, volume (0.0 to 2.0)
     clip_mute_toggled = pyqtSignal(str)  # clip_id
+    clip_fade_changed = pyqtSignal(str, float, float)  # clip_id, fade_in_duration, fade_out_duration
+    
+    # Fade handle constants
+    FADE_HANDLE_SIZE = 20  # Size of fade handle area (pixels)
+    FADE_HANDLE_MIN_DISTANCE = 10  # Minimum distance between fade handles (pixels)
     
     def __init__(self, track_id: int, name: str, height: int = 60, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -155,7 +160,16 @@ class TimelineTrack(QWidget):
         self._drag_clip_source_start = 0.0
         self._drag_clip_source_end = 0.0
         self._drag_clip_id = None
-        self._drag_mode = None  # move, trim_left, trim_right
+        self._drag_mode = None  # move, trim_left, trim_right, fade_in, fade_out
+        
+        # Fade handle state
+        self._is_dragging_fade = False
+        self._fade_drag_initial_in = 0.0
+        self._fade_drag_initial_out = 0.0
+        
+        # Hover state for fade handles
+        self._hovered_fade_clip_id: Optional[str] = None
+        self._hovered_fade_type: str = 'none'  # 'fade_in', 'fade_out', or 'none'
         
         self.setFixedHeight(height)
         self.setMinimumWidth(1000)
@@ -207,8 +221,76 @@ class TimelineTrack(QWidget):
 
         return (None, 'none')
 
+    def _get_fade_handle_at_position(self, x: float, y: float) -> tuple[Optional[str], str]:
+        """Check if position is on a fade handle and return clip_id and handle type.
+
+        Args:
+            x: X coordinate in pixels
+            y: Y coordinate in pixels
+
+        Returns:
+            Tuple of (clip_id, handle_type) where handle_type is 'fade_in', 'fade_out', or 'none'
+        """
+        click_time = x / self._pixels_per_second
+        margin = 3  # Clip margin
+        handle_size = self.FADE_HANDLE_SIZE
+
+        for clip in self.clips:
+            clip_start_time = clip.timeline_start
+            clip_end_time = clip.timeline_start + clip.duration
+
+            if clip_start_time <= click_time <= clip_end_time:
+                left_edge = clip_start_time * self._pixels_per_second
+                right_edge = clip_end_time * self._pixels_per_second
+                clip_width = right_edge - left_edge
+
+                # Clip must be wide enough to have fade handles
+                if clip_width < handle_size * 2 + self.FADE_HANDLE_MIN_DISTANCE * 2:
+                    continue
+
+                # Check if click is in the top portion of the clip (handle area)
+                if y > margin + handle_size:
+                    continue
+
+                # Fade in handle (top-left corner)
+                fade_in_x = left_edge
+                fade_in_width = min(handle_size, clip_width / 2 - self.FADE_HANDLE_MIN_DISTANCE)
+                if fade_in_width > 0 and fade_in_x <= x <= fade_in_x + fade_in_width:
+                    return (clip.clip_id, 'fade_in')
+
+                # Fade out handle (top-right corner)
+                fade_out_width = min(handle_size, clip_width / 2 - self.FADE_HANDLE_MIN_DISTANCE)
+                if fade_out_width > 0 and right_edge - fade_out_width <= x <= right_edge:
+                    return (clip.clip_id, 'fade_out')
+
+        return (None, 'none')
+
+    def _get_fade_constraints(self, clip_id: str, fade_type: str) -> tuple[float, float]:
+        """Get min/max constraints for fade handles to avoid overlapping.
+
+        Args:
+            clip_id: ID of the clip
+            fade_type: 'fade_in' or 'fade_out'
+
+        Returns:
+            Tuple of (min_duration, max_duration) in seconds
+        """
+        clip = next(c for c in self.clips if c.clip_id == clip_id)
+        min_duration = 0.0
+        max_duration = clip.duration
+
+        if fade_type == 'fade_in':
+            # Fade in cannot exceed duration - fade_out_duration
+            max_duration = max(0.0, clip.duration - clip.fade_out_duration)
+        else:
+            # Fade out cannot exceed duration - fade_in_duration
+            max_duration = max(0.0, clip.duration - clip.fade_in_duration)
+
+        return (min_duration, max_duration)
+
     def mousePressEvent(self, event: QMouseEvent):
         click_x = event.position().x()
+        click_y = event.position().y()
         click_time = click_x / self._pixels_per_second
 
         if event.button() == Qt.MouseButton.RightButton:
@@ -233,6 +315,21 @@ class TimelineTrack(QWidget):
                 self.playhead_moved.emit(max(0, click_time))
                 return
 
+            # Check if we clicked on a fade handle first (for all clips)
+            fade_clip_id, fade_handle_type = self._get_fade_handle_at_position(click_x, click_y)
+            if fade_clip_id and fade_handle_type in ('fade_in', 'fade_out'):
+                clip = next(c for c in self.clips if c.clip_id == fade_clip_id)
+                self._is_dragging_fade = True
+                self._drag_clip_id = fade_clip_id
+                self._drag_start_pos = event.position()
+                self._drag_mode = fade_handle_type
+                self._fade_drag_initial_in = clip.fade_in_duration
+                self._fade_drag_initial_out = clip.fade_out_duration
+                self._selected_clip_id = fade_clip_id
+                self._notify_clip_selected(fade_clip_id)
+                self.update()
+                return
+
             # Check if we clicked on a clip
             for clip in self.clips:
                 if clip.timeline_start <= click_time <= clip.timeline_start + clip.duration:
@@ -246,14 +343,38 @@ class TimelineTrack(QWidget):
                     self._selected_clip_id = clip.clip_id
                     self._notify_clip_selected(clip.clip_id)
 
-                    # Determine if trimming left/right edge
+                    # Determine if trimming left/right edge (skip fade handle areas)
                     left_edge = clip.timeline_start * self._pixels_per_second
                     right_edge = (clip.timeline_start + clip.duration) * self._pixels_per_second
                     edge_tolerance = 6
-                    if abs(click_x - left_edge) <= edge_tolerance:
+                    handle_size = self.FADE_HANDLE_SIZE
+                    clip_width = right_edge - left_edge
+
+                    # Calculate fade handle regions
+                    fade_in_width = min(handle_size, clip_width / 2 - self.FADE_HANDLE_MIN_DISTANCE)
+                    fade_out_width = min(handle_size, clip_width / 2 - self.FADE_HANDLE_MIN_DISTANCE)
+
+                    # Check if we're in fade handle area (top portion only)
+                    in_fade_area = click_y <= 3 + handle_size
+
+                    if abs(click_x - left_edge) <= edge_tolerance and not in_fade_area:
                         self._drag_mode = "trim_left"
-                    elif abs(click_x - right_edge) <= edge_tolerance:
+                    elif abs(click_x - right_edge) <= edge_tolerance and not in_fade_area:
                         self._drag_mode = "trim_right"
+                    elif in_fade_area and click_x - left_edge <= fade_in_width:
+                        # Fade in handle
+                        self._is_dragging_clip = False
+                        self._is_dragging_fade = True
+                        self._drag_mode = "fade_in"
+                        self._fade_drag_initial_in = clip.fade_in_duration
+                        self._fade_drag_initial_out = clip.fade_out_duration
+                    elif in_fade_area and right_edge - click_x <= fade_out_width:
+                        # Fade out handle
+                        self._is_dragging_clip = False
+                        self._is_dragging_fade = True
+                        self._drag_mode = "fade_out"
+                        self._fade_drag_initial_in = clip.fade_in_duration
+                        self._fade_drag_initial_out = clip.fade_out_duration
                     else:
                         self._drag_mode = "move"
 
@@ -315,7 +436,31 @@ class TimelineTrack(QWidget):
             parent = parent.parent()
 
     def mouseMoveEvent(self, event: QMouseEvent):
-        if self._is_dragging_clip and self._drag_clip_id:
+        if self._is_dragging_fade and self._drag_clip_id:
+            # Handle fade handle dragging
+            target_clip = next(c for c in self.clips if c.clip_id == self._drag_clip_id)
+            delta_x = event.position().x() - self._drag_start_pos.x()
+            delta_time = delta_x / self._pixels_per_second
+
+            if self._drag_mode == "fade_in":
+                # Fade in: dragging right increases fade, dragging left decreases
+                min_duration, max_duration = self._get_fade_constraints(self._drag_clip_id, "fade_in")
+
+                new_fade_in = self._fade_drag_initial_in + delta_time
+                new_fade_in = max(min_duration, min(new_fade_in, max_duration))
+
+                target_clip.set_fade_in(new_fade_in)
+                self.update()
+            elif self._drag_mode == "fade_out":
+                # Fade out: dragging left increases fade, dragging right decreases
+                min_duration, max_duration = self._get_fade_constraints(self._drag_clip_id, "fade_out")
+
+                new_fade_out = self._fade_drag_initial_out - delta_time
+                new_fade_out = max(min_duration, min(new_fade_out, max_duration))
+
+                target_clip.set_fade_out(new_fade_out)
+                self.update()
+        elif self._is_dragging_clip and self._drag_clip_id:
             target_clip = next(c for c in self.clips if c.clip_id == self._drag_clip_id)
             delta_x = event.position().x() - self._drag_start_pos.x()
             delta_time = delta_x / self._pixels_per_second
@@ -332,6 +477,8 @@ class TimelineTrack(QWidget):
                 target_clip.start_time = self._drag_clip_source_start + (new_start - self._drag_clip_initial_start)
                 target_clip.end_time = self._drag_clip_source_end
                 target_clip.duration = max(min_duration, target_clip.end_time - target_clip.start_time)
+                # Clamp fade durations to new clip duration
+                target_clip.clamp_fade_durations()
                 self.update()
             elif self._drag_mode == "trim_right":
                 # Get collision constraints
@@ -342,6 +489,8 @@ class TimelineTrack(QWidget):
 
                 target_clip.duration = max(min_duration, new_end - self._drag_clip_initial_start)
                 target_clip.end_time = target_clip.start_time + target_clip.duration
+                # Clamp fade durations to new clip duration
+                target_clip.clamp_fade_durations()
                 self.update()
             else:
                 new_start = max(0, self._drag_clip_initial_start + delta_time)
@@ -374,9 +523,22 @@ class TimelineTrack(QWidget):
         else:
             # Not dragging - update cursor based on hover position
             hover_x = event.position().x()
+            hover_y = event.position().y()
             clip_id, edge_type = self._get_clip_edge_at_position(hover_x)
 
-            if edge_type in ('left', 'right'):
+            # Check for fade handle hover
+            fade_clip_id, fade_handle_type = self._get_fade_handle_at_position(hover_x, hover_y)
+
+            # Update hover state for fade handles
+            if fade_clip_id != self._hovered_fade_clip_id or fade_handle_type != self._hovered_fade_type:
+                self._hovered_fade_clip_id = fade_clip_id
+                self._hovered_fade_type = fade_handle_type
+                self.update()  # Repaint to show hover effect
+
+            if fade_handle_type in ('fade_in', 'fade_out'):
+                # Use pointing hand cursor for fade handles
+                self.setCursor(Qt.CursorShape.PointingHandCursor)
+            elif edge_type in ('left', 'right'):
                 self.setCursor(Qt.CursorShape.SizeHorCursor)
             elif clip_id:
                 self.setCursor(Qt.CursorShape.OpenHandCursor)
@@ -384,6 +546,16 @@ class TimelineTrack(QWidget):
                 self.setCursor(Qt.CursorShape.ArrowCursor)
 
     def mouseReleaseEvent(self, event: QMouseEvent):
+        if self._is_dragging_fade and self._drag_clip_id:
+            target_clip = next((c for c in self.clips if c.clip_id == self._drag_clip_id), None)
+            if target_clip:
+                # Emit fade changed signal
+                self.clip_fade_changed.emit(
+                    target_clip.clip_id,
+                    target_clip.fade_in_duration,
+                    target_clip.fade_out_duration
+                )
+
         if self._is_dragging_clip and self._drag_clip_id:
             target_clip = next((c for c in self.clips if c.clip_id == self._drag_clip_id), None)
             if target_clip:
@@ -396,6 +568,7 @@ class TimelineTrack(QWidget):
 
         self._is_dragging_clip = False
         self._is_dragging_playhead = False
+        self._is_dragging_fade = False
         self._drag_clip_id = None
         self._drag_mode = None
         self.setCursor(Qt.CursorShape.ArrowCursor)
@@ -403,6 +576,11 @@ class TimelineTrack(QWidget):
     def leaveEvent(self, event):
         """Handle mouse leaving the widget."""
         self.setCursor(Qt.CursorShape.ArrowCursor)
+        # Clear hover state
+        if self._hovered_fade_clip_id is not None:
+            self._hovered_fade_clip_id = None
+            self._hovered_fade_type = 'none'
+            self.update()
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         """Handle drag enter event."""
@@ -456,6 +634,16 @@ class TimelineTrack(QWidget):
         """Add a clip to this track."""
         self.clips.append(clip)
         self.update()
+
+    def update_clip_fade(self, clip_id: str, fade_in: float, fade_out: float) -> bool:
+        """Update fade durations for a clip on this track."""
+        for clip in self.clips:
+            if clip.clip_id == clip_id:
+                clip.set_fade_in(fade_in)
+                clip.set_fade_out(fade_out)
+                self.update()
+                return True
+        return False
     
     def remove_clip(self, clip_id: str) -> bool:
         """Remove a clip from this track."""
@@ -600,6 +788,9 @@ class TimelineTrack(QWidget):
         
         painter.drawRoundedRect(rect, 4, 4)
 
+        # Draw fade zones for all clips (both video and audio with detached audio)
+        self._draw_fade_zones(painter, rect, clip)
+
         # Draw a simple waveform style for audio clips.
         if getattr(clip, "is_audio_only", False):
             self._draw_audio_waveform(painter, rect, clip)
@@ -619,6 +810,117 @@ class TimelineTrack(QWidget):
         painter.setFont(font)
         duration_text = f"{clip.duration:.1f}s"
         painter.drawText(text_rect, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom, duration_text)
+
+    def _draw_fade_zones(self, painter: QPainter, rect: QRect, clip: TimelineClip):
+        """Draw fade in/out zones as shaded, semi-transparent triangles on the clip.
+
+        Fade in: triangle on the left, slope from top-right to bottom-left.
+        Fade out: triangle on the right, slope from top-left to bottom-right.
+        Shows hover highlight when mouse is over fade handle.
+        """
+        if clip.duration <= 0:
+            return
+
+        fade_in = clip.fade_in_duration
+        fade_out = clip.fade_out_duration
+
+        if fade_in <= 0 and fade_out <= 0:
+            return
+
+        # Calculate pixel positions
+        clip_width = rect.width()
+        clip_left = rect.left()
+        clip_top = rect.top()
+        clip_bottom = rect.bottom()
+
+        # Check if this clip is being hovered
+        is_hovered = (self._hovered_fade_clip_id == clip.clip_id)
+        hover_fade_in = is_hovered and self._hovered_fade_type == 'fade_in'
+        hover_fade_out = is_hovered and self._hovered_fade_type == 'fade_out'
+
+        fade_fill = QColor(255, 255, 255, 110)  # Semi-transparent white fill
+        fade_line = QPen(QColor(255, 255, 255, 160))
+        fade_line.setWidth(2)
+
+        # Hover highlight colors
+        hover_fill = QColor(0, 188, 212, 80)  # Cyan-ish highlight
+        hover_line = QPen(QColor(0, 188, 212, 200))
+        hover_line.setWidth(3)
+
+        # Fade in: shaded triangle on left, slope from top-right to bottom-left
+        if fade_in > 0:
+            fade_in_width = min(clip_width, int(fade_in * self._pixels_per_second))
+            if fade_in_width > 0:
+                fade_in_polygon = QPolygonF()
+                fade_in_polygon.append(QPointF(clip_left, clip_top))
+                fade_in_polygon.append(QPointF(clip_left + fade_in_width, clip_top))
+                fade_in_polygon.append(QPointF(clip_left, clip_bottom))
+
+                # Use hover highlight if hovering over fade in handle
+                if hover_fade_in:
+                    painter.setBrush(QBrush(hover_fill))
+                    painter.setPen(hover_line)
+                    painter.drawPolygon(fade_in_polygon)
+                else:
+                    painter.setBrush(QBrush(fade_fill))
+                    painter.setPen(Qt.PenStyle.NoPen)
+                    painter.drawPolygon(fade_in_polygon)
+
+                    painter.setPen(fade_line)
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
+                    painter.drawLine(clip_left + fade_in_width, clip_top, clip_left, clip_bottom)
+
+                # Handle indicator (small filled triangle at top-left)
+                handle_size = min(self.FADE_HANDLE_SIZE, clip_width / 2 - self.FADE_HANDLE_MIN_DISTANCE)
+                if handle_size > 0:
+                    handle_brush = QBrush(QColor(255, 255, 255, 200))
+                    painter.setBrush(handle_brush)
+                    handle_pen = QPen(QColor(255, 255, 255, 255))
+                    handle_pen.setWidth(1)
+                    painter.setPen(handle_pen)
+                    handle_triangle = QPolygonF()
+                    handle_triangle.append(QPointF(clip_left, clip_top))
+                    handle_triangle.append(QPointF(clip_left + handle_size * 0.5, clip_top))
+                    handle_triangle.append(QPointF(clip_left, clip_top + handle_size * 0.5))
+                    painter.drawPolygon(handle_triangle)
+
+        # Fade out: shaded triangle on right, slope from top-left to bottom-right
+        if fade_out > 0:
+            fade_out_width = min(clip_width, int(fade_out * self._pixels_per_second))
+            if fade_out_width > 0:
+                fade_out_start_x = clip_left + clip_width - fade_out_width
+                fade_out_polygon = QPolygonF()
+                fade_out_polygon.append(QPointF(fade_out_start_x, clip_top))
+                fade_out_polygon.append(QPointF(clip_left + clip_width, clip_top))
+                fade_out_polygon.append(QPointF(clip_left + clip_width, clip_bottom))
+
+                # Use hover highlight if hovering over fade out handle
+                if hover_fade_out:
+                    painter.setBrush(QBrush(hover_fill))
+                    painter.setPen(hover_line)
+                    painter.drawPolygon(fade_out_polygon)
+                else:
+                    painter.setBrush(QBrush(fade_fill))
+                    painter.setPen(Qt.PenStyle.NoPen)
+                    painter.drawPolygon(fade_out_polygon)
+
+                    painter.setPen(fade_line)
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
+                    painter.drawLine(fade_out_start_x, clip_top, clip_left + clip_width, clip_bottom)
+
+                # Handle indicator (small filled triangle at top-right)
+                handle_size = min(self.FADE_HANDLE_SIZE, clip_width / 2 - self.FADE_HANDLE_MIN_DISTANCE)
+                if handle_size > 0:
+                    handle_brush = QBrush(QColor(255, 255, 255, 200))
+                    painter.setBrush(handle_brush)
+                    handle_pen = QPen(QColor(255, 255, 255, 255))
+                    handle_pen.setWidth(1)
+                    painter.setPen(handle_pen)
+                    handle_triangle = QPolygonF()
+                    handle_triangle.append(QPointF(clip_left + clip_width, clip_top))
+                    handle_triangle.append(QPointF(clip_left + clip_width - handle_size * 0.5, clip_top))
+                    handle_triangle.append(QPointF(clip_left + clip_width, clip_top + handle_size * 0.5))
+                    painter.drawPolygon(handle_triangle)
 
     def _draw_audio_waveform(self, painter: QPainter, rect: QRect, clip: TimelineClip):
         """Draw stylized waveform bars for audio clips."""
@@ -743,6 +1045,7 @@ class TimelineWidget(QWidget):
     detach_audio_requested = pyqtSignal(str)
     clip_volume_changed = pyqtSignal(str, float)  # clip_id, volume (0.0 to 2.0)
     clip_mute_toggled = pyqtSignal(str)  # clip_id
+    clip_fade_changed = pyqtSignal(str, float, float)  # clip_id, fade_in_duration, fade_out_duration
     
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -946,6 +1249,7 @@ class TimelineWidget(QWidget):
         track.playhead_moved.connect(self.set_playhead_position)
         track.clip_volume_changed.connect(self.clip_volume_changed.emit)
         track.clip_mute_toggled.connect(self.clip_mute_toggled.emit)
+        track.clip_fade_changed.connect(self._on_clip_fade_changed)
         
         # Track header
         track_header = QWidget()
@@ -970,6 +1274,14 @@ class TimelineWidget(QWidget):
         self._tracks.append(track)
         
         return track_id
+
+    def _on_clip_fade_changed(self, clip_id: str, fade_in: float, fade_out: float):
+        """Handle fade changed signal from track."""
+        self.clip_fade_changed.emit(clip_id, fade_in, fade_out)
+        # Update local track model so fades are reflected in UI and preview
+        for track in self._tracks:
+            if track.update_clip_fade(clip_id, fade_in, fade_out):
+                break
     
     def _on_media_dropped(self, media_id: str, name: str, duration: float, timeline_start: float):
         """Handle media dropped on a track."""
