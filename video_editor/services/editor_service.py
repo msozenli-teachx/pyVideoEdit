@@ -60,7 +60,8 @@ class TimelineClip:
     has_detached_audio: bool = False
     fade_in_duration: float = 0.0  # Fade in duration in seconds (from start of clip)
     fade_out_duration: float = 0.0  # Fade out duration in seconds (from end of clip)
-    
+    speed: float = 1.0  # Playback speed multiplier (0.25 to 4.0, 1.0 = normal)
+
     def __post_init__(self):
         """Initialize source media bounds if not set."""
         if self.source_media_start == 0.0 and self.source_media_end == 0.0:
@@ -72,6 +73,22 @@ class TimelineClip:
     def is_audio_only(self) -> bool:
         """Check if this clip is audio-only on the timeline."""
         return self.clip_type in ("audio", "detached_audio")
+
+    @property
+    def source_duration(self) -> float:
+        """Get the source media duration (before speed adjustment)."""
+        return self.end_time - self.start_time
+
+    @property
+    def effective_duration(self) -> float:
+        """Get the timeline duration after speed adjustment.
+
+        A speed of 2.0 means the clip plays twice as fast, so it takes half the time.
+        A speed of 0.5 means the clip plays at half speed, so it takes twice the time.
+        """
+        if self.speed <= 0:
+            return self.duration
+        return self.source_duration / self.speed
 
     def get_effective_volume(self) -> float:
         """Effective volume (mute-aware)."""
@@ -99,6 +116,20 @@ class TimelineClip:
             ratio = max_total / (self.fade_in_duration + self.fade_out_duration)
             self.fade_in_duration *= ratio
             self.fade_out_duration *= ratio
+
+    def set_speed(self, speed: float) -> None:
+        """Set playback speed and update duration accordingly.
+
+        Args:
+            speed: Speed multiplier (0.25 to 4.0, 1.0 = normal speed)
+        """
+        # Clamp speed to valid range
+        speed = max(0.25, min(4.0, speed))
+        self.speed = speed
+        # Update duration based on speed
+        self.duration = self.effective_duration
+        # Clamp fade durations to new duration
+        self.clamp_fade_durations()
 
     def get_volume_at_position(self, position_in_clip: float) -> float:
         """Get the effective volume at a position within the clip (0.0 to 1.0 relative).
@@ -369,6 +400,106 @@ class EditorService(QObject):
             self.timeline_updated.emit()
             return True
         return False
+
+    def delete_clip(self, clip_id: str) -> List[str]:
+        """Delete a clip from the timeline, leaving a gap.
+
+        Also handles linked clips (e.g., detached audio) by deleting them together.
+
+        Args:
+            clip_id: ID of the clip to delete
+
+        Returns:
+            List of deleted clip IDs (includes any linked clips)
+        """
+        deleted_ids: List[str] = []
+
+        # Find the clip to delete
+        clip = self.get_clip_by_id(clip_id)
+        if not clip:
+            return deleted_ids
+
+        deleted_ids.append(clip_id)
+
+        # Handle linked clips
+        if clip.has_detached_audio:
+            # This is a video clip with detached audio - find and delete the audio clip too
+            for c in self._timeline_clips:
+                if c.linked_clip_id == clip_id and c.clip_type == "detached_audio":
+                    deleted_ids.append(c.clip_id)
+                    break
+        elif clip.clip_type == "detached_audio" and clip.linked_clip_id:
+            # This is a detached audio clip - also delete the parent video clip
+            parent_clip = self.get_clip_by_id(clip.linked_clip_id)
+            if parent_clip:
+                deleted_ids.append(clip.linked_clip_id)
+
+        # Remove all identified clips
+        self._timeline_clips = [c for c in self._timeline_clips if c.clip_id not in deleted_ids]
+
+        if deleted_ids:
+            self.timeline_updated.emit()
+
+        return deleted_ids
+
+    def ripple_delete_clip(self, clip_id: str) -> List[str]:
+        """Delete a clip and close the gap by shifting subsequent clips left.
+
+        Also handles linked clips (e.g., detached audio) by deleting them together
+        and ensuring the ripple operation is synchronized across all tracks.
+
+        Args:
+            clip_id: ID of the clip to delete
+
+        Returns:
+            List of deleted clip IDs (includes any linked clips)
+        """
+        deleted_ids: List[str] = []
+
+        # Find the clip to delete
+        clip = self.get_clip_by_id(clip_id)
+        if not clip:
+            return deleted_ids
+
+        # Get the clip's time range for the gap to close
+        clip_start = clip.timeline_start
+        clip_duration = clip.duration
+        clip_end = clip_start + clip_duration
+
+        deleted_ids.append(clip_id)
+
+        # Handle linked clips
+        if clip.has_detached_audio:
+            # This is a video clip with detached audio - find and delete the audio clip too
+            for c in self._timeline_clips:
+                if c.linked_clip_id == clip_id and c.clip_type == "detached_audio":
+                    deleted_ids.append(c.clip_id)
+                    break
+        elif clip.clip_type == "detached_audio" and clip.linked_clip_id:
+            # This is a detached audio clip - also delete the parent video clip
+            parent_clip = self.get_clip_by_id(clip.linked_clip_id)
+            if parent_clip:
+                deleted_ids.append(clip.linked_clip_id)
+                # Use the parent clip's time range for ripple
+                clip_start = parent_clip.timeline_start
+                clip_duration = parent_clip.duration
+                clip_end = clip_start + clip_duration
+
+        # Remove all identified clips
+        self._timeline_clips = [c for c in self._timeline_clips if c.clip_id not in deleted_ids]
+
+        # Shift all clips that start after the deleted clip's end time
+        for c in self._timeline_clips:
+            if c.timeline_start >= clip_end:
+                c.timeline_start -= clip_duration
+            elif c.timeline_start > clip_start:
+                # Clip starts within the deleted region - shift to clip_start
+                c.timeline_start = clip_start
+
+        if deleted_ids:
+            self.timeline_updated.emit()
+
+        return deleted_ids
     
     def get_timeline_clips(self) -> List[TimelineClip]:
         """Get all clips on the timeline."""
@@ -529,6 +660,42 @@ class EditorService(QObject):
         clip.muted = not clip.muted
         self.timeline_updated.emit()
         return clip.muted
+
+    def set_clip_speed(self, clip_id: str, speed: float) -> bool:
+        """Set clip playback speed.
+
+        Args:
+            clip_id: ID of the clip to modify
+            speed: Speed multiplier (0.25 to 4.0, 1.0 = normal speed)
+
+        Returns:
+            True if speed was set successfully
+        """
+        clip = self.get_clip_by_id(clip_id)
+        if not clip:
+            return False
+
+        # Store old duration for comparison
+        old_duration = clip.duration
+
+        # Set the new speed (this also updates duration)
+        clip.set_speed(speed)
+
+        # If the clip has linked audio (detached), update its speed too
+        if clip.has_detached_audio:
+            # Find the detached audio clip and update its speed
+            for c in self._timeline_clips:
+                if c.linked_clip_id == clip_id and c.clip_type == "detached_audio":
+                    c.set_speed(speed)
+                    break
+        elif clip.clip_type == "detached_audio" and clip.linked_clip_id:
+            # This is a detached audio clip - also update parent video clip
+            parent_clip = self.get_clip_by_id(clip.linked_clip_id)
+            if parent_clip:
+                parent_clip.set_speed(speed)
+
+        self.timeline_updated.emit()
+        return True
 
     def detach_audio_from_clip(self, clip_id: str) -> Optional[TimelineClip]:
         """Detach audio from a single video clip by creating an audio-only clip."""

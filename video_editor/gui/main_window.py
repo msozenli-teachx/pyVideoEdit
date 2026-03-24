@@ -190,6 +190,13 @@ class MainWindow(QMainWindow):
         self.timeline.clip_mute_toggled.connect(self._on_clip_mute_toggled)
         self.timeline.clip_fade_changed.connect(self._on_clip_fade_changed)
         self.timeline.detach_audio_requested.connect(self._on_detach_audio_requested)
+        self.timeline.clip_delete_requested.connect(self._on_clip_delete_requested)
+        self.timeline.clip_ripple_delete_requested.connect(self._on_clip_ripple_delete_requested)
+        self.timeline.play_pause_requested.connect(self._on_play_pause_requested)
+        self.timeline.playhead_step_requested.connect(self._on_playhead_step_requested)
+        self.timeline.split_at_playhead_requested.connect(self._on_split_at_playhead_requested)
+        self.timeline.detach_audio_shortcut_requested.connect(self._on_detach_audio_shortcut_requested)
+        self.timeline.clip_speed_requested.connect(self._on_clip_speed_requested)
         
         # Editor service signals
         self._editor_service.media_imported.connect(self._on_media_imported)
@@ -672,6 +679,58 @@ class MainWindow(QMainWindow):
 
         self.status_bar.showMessage(f"Detached audio for {len(audio_clips)} clips", 3000)
 
+    def _on_clip_delete_requested(self, clip_id: str):
+        """Handle clip delete request - delete clip leaving gap."""
+        deleted_ids = self._editor_service.delete_clip(clip_id)
+        if deleted_ids:
+            # Remove clips from timeline UI
+            for deleted_id in deleted_ids:
+                self.timeline.remove_clip(deleted_id)
+
+            self.timeline.refresh_duration()
+            timeline_clips = self._refresh_preview_timeline_model()
+
+            # If no clips remain, stop playback and reset preview
+            if not timeline_clips:
+                self.preview.stop_timeline_playback()
+                self.preview.clear_media()
+
+            self.status_bar.showMessage(f"Deleted {len(deleted_ids)} clip(s)", 2000)
+
+    def _on_clip_ripple_delete_requested(self, clip_id: str):
+        """Handle clip ripple delete request - delete and close gap."""
+        deleted_ids = self._editor_service.ripple_delete_clip(clip_id)
+        if deleted_ids:
+            # Remove clips from timeline UI
+            for deleted_id in deleted_ids:
+                self.timeline.remove_clip(deleted_id)
+
+            # Update timeline to reflect shifted clips
+            self.timeline.refresh_duration()
+
+            # Re-sync timeline UI with service layer (clips have been shifted)
+            self._sync_timeline_with_service()
+
+            timeline_clips = self._refresh_preview_timeline_model()
+
+            # If no clips remain, stop playback and reset preview
+            if not timeline_clips:
+                self.preview.stop_timeline_playback()
+                self.preview.clear_media()
+
+            self.status_bar.showMessage(f"Ripple deleted {len(deleted_ids)} clip(s)", 2000)
+
+    def _sync_timeline_with_service(self):
+        """Synchronize timeline UI clips with service layer state."""
+        # Clear all tracks
+        for track in self.timeline._tracks:
+            track.clear()
+
+        # Re-add all clips from service
+        for clip in self._editor_service.get_timeline_clips():
+            track_id = clip.track_id if 0 <= clip.track_id < len(self.timeline._tracks) else 0
+            self.timeline.add_clip_to_track(track_id, clip)
+
     def _on_preview_position_changed(self, position: float):
         """Handle preview position change - sync with timeline."""
         # This prevents feedback loops
@@ -718,6 +777,71 @@ class MainWindow(QMainWindow):
         self.preview.mute_preview_audio()
 
         logger.info("Stopped and reset to beginning")
+
+    def _on_play_pause_requested(self):
+        """Handle spacebar press - toggle play/pause."""
+        if self.preview.is_timeline_playing():
+            self.preview.pause_preview_playback()
+            logger.debug("Paused via spacebar")
+        else:
+            # Start playback from current position
+            timeline_clips = self._editor_service.get_sorted_timeline_clips()
+            if timeline_clips:
+                current_pos = self.timeline._playhead_position
+                self.preview.start_timeline_playback(timeline_clips, current_pos)
+                logger.debug(f"Started playback via spacebar at {current_pos:.2f}s")
+
+    def _on_playhead_step_requested(self, step_seconds: float):
+        """Handle arrow key press - step playhead by specified amount."""
+        current_pos = self.timeline._playhead_position
+        new_pos = max(0, current_pos + step_seconds)
+
+        # Get timeline duration to cap position
+        timeline_duration = self._editor_service.get_timeline_duration()
+        if timeline_duration > 0:
+            new_pos = min(new_pos, timeline_duration)
+
+        self.timeline.set_playhead_position(new_pos)
+
+        # If playing, seek the playback engine
+        if self.preview.is_timeline_playing():
+            self.preview.seek_timeline(new_pos)
+
+        logger.debug(f"Stepped playhead by {step_seconds:.2f}s to {new_pos:.2f}s")
+
+    def _on_split_at_playhead_requested(self):
+        """Handle 'C' key press - split selected clip or clip at playhead."""
+        # Try to get selected clip first
+        clip_id = self.timeline._get_selected_clip_id()
+
+        # If no clip selected, try to find clip at playhead
+        if not clip_id:
+            clip_id = self.timeline._get_clip_at_playhead()
+
+        if clip_id:
+            self._on_split_requested(clip_id)
+            logger.debug(f"Split clip {clip_id} at playhead via 'C' key")
+        else:
+            self.status_bar.showMessage("No clip to split at playhead position", 2000)
+
+    def _on_detach_audio_shortcut_requested(self):
+        """Handle Ctrl+D - detach audio for all eligible clips."""
+        self._on_detach_audio_requested("")
+        logger.debug("Detach audio triggered via Ctrl+D")
+
+    def _on_clip_speed_requested(self, clip_id: str, speed: float):
+        """Handle clip speed change request."""
+        if self._editor_service.set_clip_speed(clip_id, speed):
+            # Re-sync timeline UI with service layer (duration has changed)
+            self._sync_timeline_with_service()
+            self._refresh_preview_timeline_model()
+
+            # Update speed button display
+            clip = self._editor_service.get_clip_by_id(clip_id)
+            self.timeline.update_speed_button_for_clip(clip)
+
+            self.status_bar.showMessage(f"Clip speed set to {speed:.2f}x", 2000)
+            logger.debug(f"Clip {clip_id} speed set to {speed:.2f}x")
 
     def _on_timeline_updated(self):
         """Handle timeline updates."""

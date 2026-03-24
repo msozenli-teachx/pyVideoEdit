@@ -288,14 +288,14 @@ class TimelinePlaybackEngine(QObject):
     
     def set_timeline_clips(self, clips: List[TimelineClip]):
         """Set the timeline clips and build playback segments.
-        
+
         Args:
             clips: List of TimelineClip objects
         """
         self._clips = sorted(clips, key=lambda c: c.timeline_start)
         self._build_segments()
         self._calculate_duration()
-        
+
         # CRITICAL: Reset segment tracking when clips change
         # This is crucial when trim/split happens during playback
         # Otherwise _current_segment points to stale segment data with old boundaries
@@ -303,7 +303,12 @@ class TimelinePlaybackEngine(QObject):
         self._current_segment = None
         self._last_loaded_clip_id = None
         self._last_detached_audio_clip_id = None
-        
+
+        # If no clips remain and we're playing, stop playback
+        if not self._clips and self._state == PlaybackState.PLAYING:
+            logger.info("No clips remaining, stopping playback")
+            self.stop()
+
         logger.info(f"Timeline set with {len(self._clips)} clips, {len(self._segments)} segments, duration: {self._duration:.2f}s")
     
     def _build_segments(self):
@@ -676,7 +681,7 @@ class TimelinePlaybackEngine(QObject):
         """Update the current segment based on position and sync media player."""
         # Find the segment at current position
         segment = self.get_segment_at_position(self._position)
-        
+
         if segment is None:
             # We might be in a gap before the first clip
             if self._segments and self._position < self._segments[0].timeline_start:
@@ -696,15 +701,29 @@ class TimelinePlaybackEngine(QObject):
                     self._display_gap_state()
                     self._sync_detached_audio()
                 return
-        
-        # Check if segment changed
-        segment_index = self._segments.index(segment)
+
+        # Check if segment changed - use safe index lookup
+        try:
+            segment_index = self._segments.index(segment)
+        except ValueError:
+            # Segment not in list (stale reference after clip deletion)
+            logger.warning("Stale segment reference detected, rebuilding segments")
+            self._current_segment_index = -1
+            self._current_segment = None
+            self._last_loaded_clip_id = None
+            # Re-find the segment
+            segment = self.get_segment_at_position(self._position)
+            if segment is None:
+                self._display_gap_state()
+                return
+            segment_index = self._segments.index(segment)
+
         segment_changed = (segment_index != self._current_segment_index)
-        
+
         if segment_changed:
             logger.debug(f"Segment changed from {self._current_segment_index} to {segment_index}")
             self._current_segment_index = segment_index
-        
+
         # Handle segment type
         if segment.is_gap:
             self._handle_gap_segment(segment, segment_changed)
@@ -761,13 +780,25 @@ class TimelinePlaybackEngine(QObject):
 
         clip = segment.clip
 
+        # Verify clip still exists in our current clips list (may have been deleted)
+        clip_still_exists = any(c.clip_id == clip.clip_id for c in self._clips)
+        if not clip_still_exists:
+            logger.warning(f"Clip {clip.clip_id} no longer exists, treating as gap")
+            self._display_gap_state()
+            return
+
         # Check if we've exceeded the clip's end time
         if self._position >= segment.timeline_end:
             # We've passed the end of this clip - transition to next segment
             self._transition_to_next_segment()
             return
 
-        # Calculate source position
+        # Get clip speed (default to 1.0 if not set)
+        clip_speed = max(0.25, min(4.0, getattr(clip, 'speed', 1.0)))
+
+        # Calculate source position - for speed-adjusted clips, the timeline duration
+        # is already adjusted (shorter for faster speed, longer for slower speed)
+        # So we map timeline position directly to source position
         offset_in_clip = self._position - segment.timeline_start
         source_position = clip.start_time + offset_in_clip
 
@@ -792,7 +823,7 @@ class TimelinePlaybackEngine(QObject):
         need_reload = (clip_id != self._last_loaded_clip_id)
 
         if need_reload or segment_changed:
-            logger.debug(f"Loading clip {clip.name} at source position {source_position:.2f}s")
+            logger.debug(f"Loading clip {clip.name} at source position {source_position:.2f}s (speed: {clip_speed:.2f}x)")
             self._last_loaded_clip_id = clip_id
 
             # Show video widget
@@ -807,8 +838,21 @@ class TimelinePlaybackEngine(QObject):
             # Call clip load callback - this loads and positions the media
             if self._on_clip_load_callback:
                 self._on_clip_load_callback(clip, source_position)
+
+            # Set the media player playback rate for smooth speed playback
+            # This is the key fix - use QMediaPlayer's native speed control
+            if self._media_player:
+                self._media_player.setPlaybackRate(clip_speed)
         else:
-            # Same clip - always sync the media player position
+            # Same clip - ensure playback rate is correct (in case it changed)
+            if self._media_player:
+                current_rate = self._media_player.playbackRate()
+                if abs(current_rate - clip_speed) > 0.01:
+                    logger.debug(f"Updating playback rate from {current_rate:.2f}x to {clip_speed:.2f}x")
+                    self._media_player.setPlaybackRate(clip_speed)
+
+            # Sync position only if significantly out of sync
+            # With playback rate set, we don't need aggressive syncing
             self._sync_media_player_position(source_position)
 
         # Handle audio volume based on state
@@ -821,6 +865,12 @@ class TimelinePlaybackEngine(QObject):
         Ensures clean transitions by stopping media player when leaving a clip
         and properly initializing the next segment.
         """
+        # Safety check: if segments list is empty or index is invalid, finish playback
+        if not self._segments:
+            logger.debug("No segments available, finishing playback")
+            self._on_timeline_finished()
+            return
+
         if self._current_segment_index < 0 or self._current_segment_index >= len(self._segments) - 1:
             # No more video segments. If timeline duration is longer (e.g. detached
             # audio tail), continue in implicit-gap state until real timeline end.
@@ -841,6 +891,13 @@ class TimelinePlaybackEngine(QObject):
 
         # Move to next segment
         next_index = self._current_segment_index + 1
+
+        # Safety check: ensure next_index is valid
+        if next_index >= len(self._segments):
+            logger.debug("Next segment index out of bounds, finishing playback")
+            self._on_timeline_finished()
+            return
+
         next_segment = self._segments[next_index]
 
         logger.debug(f"Transitioning from segment {self._current_segment_index} to {next_index}")
@@ -913,13 +970,16 @@ class TimelinePlaybackEngine(QObject):
         """Stop the media player and clear any buffered content.
         
         Uses pause() instead of stop() for better responsiveness, but ensures
-        volume is muted to prevent audio bleed.
+        volume is muted to prevent audio bleed. Also resets playback rate to 1.0.
         """
         if not self._media_player:
             return
 
         # Pause instead of stop to keep buffers ready but stop playback
         self._media_player.pause()
+
+        # Reset playback rate to normal
+        self._media_player.setPlaybackRate(1.0)
 
         # Mute audio output
         self._mute_all_outputs()

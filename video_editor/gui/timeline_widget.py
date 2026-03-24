@@ -6,14 +6,221 @@ Supports drag and drop from media pool.
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QScrollArea, QMenu, QSlider
+    QScrollArea, QMenu, QSlider, QInputDialog, QDialog, QDialogButtonBox
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QRect, QPointF, QSize
-from PyQt6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QAction, QMouseEvent, QPaintEvent, QDragEnterEvent, QDropEvent, QPolygonF, QIcon, QPixmap
+from PyQt6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QAction, QMouseEvent, QPaintEvent, QDragEnterEvent, QDropEvent, QPolygonF, QIcon, QPixmap, QKeyEvent
 from typing import Optional, List
 import json
 
 from video_editor.services.editor_service import TimelineClip
+
+
+class SpeedDialog(QDialog):
+    """Dialog for setting clip playback speed with a horizontal slider."""
+
+    # Preset speed values
+    SPEED_PRESETS = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0]
+
+    def __init__(self, current_speed: float = 1.0, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setWindowTitle("Set Clip Speed")
+        self.setMinimumWidth(350)
+        self.setModal(True)
+
+        self._speed = current_speed
+        self._preset_buttons: List[QPushButton] = []
+
+        self._setup_ui()
+
+    def _setup_ui(self):
+        """Set up the dialog UI."""
+        layout = QVBoxLayout(self)
+        layout.setSpacing(15)
+
+        # Title label
+        title_label = QLabel("Playback Speed")
+        title_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #ffffff;")
+        layout.addWidget(title_label)
+
+        # Speed value display
+        self._speed_label = QLabel(f"{self._speed:.2f}x")
+        self._speed_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._speed_label.setStyleSheet("""
+            font-size: 24px;
+            font-weight: bold;
+            color: #00bcd4;
+            padding: 10px;
+            background-color: #2a2a2a;
+            border-radius: 5px;
+        """)
+        layout.addWidget(self._speed_label)
+
+        # Slider for speed selection
+        self._slider = QSlider(Qt.Orientation.Horizontal)
+        self._slider.setMinimum(0)
+        self._slider.setMaximum(len(self.SPEED_PRESETS) - 1)
+        self._slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self._slider.setTickInterval(1)
+        self._slider.setStyleSheet("""
+            QSlider::groove:horizontal {
+                height: 8px;
+                background: #3a3a3a;
+                border-radius: 4px;
+            }
+            QSlider::handle:horizontal {
+                background: #00bcd4;
+                border: 2px solid #00bcd4;
+                width: 18px;
+                margin: -6px 0;
+                border-radius: 9px;
+            }
+            QSlider::handle:horizontal:hover {
+                background: #26c6da;
+                border-color: #26c6da;
+            }
+            QSlider::sub-page:horizontal {
+                background: #00bcd4;
+                border-radius: 4px;
+            }
+        """)
+
+        # Set initial slider position
+        self._update_slider_from_speed()
+
+        self._slider.valueChanged.connect(self._on_slider_changed)
+        layout.addWidget(self._slider)
+
+        # Speed preset labels
+        preset_layout = QHBoxLayout()
+        preset_layout.setSpacing(0)
+
+        # Show min, normal (1x), and max labels
+        min_label = QLabel("0.25x")
+        min_label.setStyleSheet("font-size: 10px; color: #888888;")
+        preset_layout.addWidget(min_label)
+
+        preset_layout.addStretch()
+
+        normal_label = QLabel("1.0x")
+        normal_label.setStyleSheet("font-size: 10px; color: #888888;")
+        preset_layout.addWidget(normal_label)
+
+        preset_layout.addStretch()
+
+        max_label = QLabel("4.0x")
+        max_label.setStyleSheet("font-size: 10px; color: #888888;")
+        preset_layout.addWidget(max_label)
+
+        layout.addLayout(preset_layout)
+
+        # Quick preset buttons
+        preset_buttons_layout = QHBoxLayout()
+        preset_buttons_layout.setSpacing(5)
+
+        for preset in [0.5, 1.0, 1.5, 2.0]:
+            btn = QPushButton(f"{preset}x")
+            btn.setCheckable(True)
+            btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #3a3a3a;
+                    border: 1px solid #555555;
+                    border-radius: 4px;
+                    padding: 8px 12px;
+                    color: #ffffff;
+                    font-size: 12px;
+                }
+                QPushButton:hover {
+                    background-color: #4a4a4a;
+                }
+                QPushButton:checked {
+                    background-color: #00bcd4;
+                    border-color: #00bcd4;
+                }
+            """)
+            btn.clicked.connect(lambda checked, p=preset: self._set_speed_preset(p))
+            if abs(self._speed - preset) < 0.01:
+                btn.setChecked(True)
+            preset_buttons_layout.addWidget(btn)
+            self._preset_buttons.append(btn)
+
+        layout.addLayout(preset_buttons_layout)
+
+        # Description label
+        desc_label = QLabel("0.5x = half speed (slower)\n1.0x = normal speed\n2.0x = double speed (faster)")
+        desc_label.setStyleSheet("font-size: 11px; color: #888888; padding-top: 5px;")
+        layout.addWidget(desc_label)
+
+        # Dialog buttons
+        button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        button_box.setStyleSheet("""
+            QPushButton {
+                background-color: #3a3a3a;
+                border: 1px solid #555555;
+                border-radius: 4px;
+                padding: 8px 20px;
+                color: #ffffff;
+                font-size: 12px;
+                min-width: 80px;
+            }
+            QPushButton:hover {
+                background-color: #4a4a4a;
+            }
+            QPushButton:pressed {
+                background-color: #2a2a2a;
+            }
+        """)
+        layout.addWidget(button_box)
+
+        # Set dialog style
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #1e1e1e;
+            }
+            QLabel {
+                color: #ffffff;
+            }
+        """)
+
+    def _update_slider_from_speed(self):
+        """Update slider position from current speed value."""
+        # Find closest preset index
+        closest_idx = 0
+        min_diff = float('inf')
+        for i, preset in enumerate(self.SPEED_PRESETS):
+            diff = abs(preset - self._speed)
+            if diff < min_diff:
+                min_diff = diff
+                closest_idx = i
+        self._slider.blockSignals(True)
+        self._slider.setValue(closest_idx)
+        self._slider.blockSignals(False)
+
+    def _on_slider_changed(self, value: int):
+        """Handle slider value change."""
+        self._speed = self.SPEED_PRESETS[value]
+        self._speed_label.setText(f"{self._speed:.2f}x")
+        self._update_preset_buttons()
+
+    def _set_speed_preset(self, speed: float):
+        """Set speed from preset button."""
+        self._speed = speed
+        self._speed_label.setText(f"{self._speed:.2f}x")
+        self._update_slider_from_speed()
+        self._update_preset_buttons()
+
+    def _update_preset_buttons(self):
+        """Update preset button checked states."""
+        for i, preset in enumerate([0.5, 1.0, 1.5, 2.0]):
+            self._preset_buttons[i].setChecked(abs(self._speed - preset) < 0.01)
+
+    def get_speed(self) -> float:
+        """Get the selected speed value."""
+        return self._speed
 
 
 def _create_split_icon() -> QIcon:
@@ -126,7 +333,7 @@ def _create_plus_icon() -> QIcon:
 
 class TimelineTrack(QWidget):
     """Single track in the timeline."""
-    
+
     # Signals
     media_dropped = pyqtSignal(str, str, float, float)  # media_id, name, duration, timeline_start
     clip_moved = pyqtSignal(str, float)  # clip_id, new_timeline_start
@@ -136,10 +343,15 @@ class TimelineTrack(QWidget):
     clip_volume_changed = pyqtSignal(str, float)  # clip_id, volume (0.0 to 2.0)
     clip_mute_toggled = pyqtSignal(str)  # clip_id
     clip_fade_changed = pyqtSignal(str, float, float)  # clip_id, fade_in_duration, fade_out_duration
-    
+    clip_delete_requested = pyqtSignal(str)  # clip_id - delete leaving gap
+    clip_ripple_delete_requested = pyqtSignal(str)  # clip_id - ripple delete (close gap)
+
     # Fade handle constants
     FADE_HANDLE_SIZE = 20  # Size of fade handle area (pixels)
     FADE_HANDLE_MIN_DISTANCE = 10  # Minimum distance between fade handles (pixels)
+
+    # Snapping constants
+    SNAP_THRESHOLD_PX = 10  # Snap threshold in pixels
     
     def __init__(self, track_id: int, name: str, height: int = 60, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -161,6 +373,7 @@ class TimelineTrack(QWidget):
         self._drag_clip_source_end = 0.0
         self._drag_clip_id = None
         self._drag_mode = None  # move, trim_left, trim_right, fade_in, fade_out
+        self._drag_original_timeline_start = 0.0  # Store original position for revert on overlap
         
         # Fade handle state
         self._is_dragging_fade = False
@@ -173,10 +386,13 @@ class TimelineTrack(QWidget):
         
         self.setFixedHeight(height)
         self.setMinimumWidth(1000)
-        
+
         # Enable drag and drop
         self.setAcceptDrops(True)
         self.setMouseTracking(True)
+
+        # Enable keyboard focus for delete key handling
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
     def _get_playhead_x(self) -> int:
         """Get the current playhead X position from parent TimelineWidget."""
@@ -301,9 +517,26 @@ class TimelineTrack(QWidget):
                     self._notify_clip_selected(clip.clip_id)
                     self.update()
                     menu = QMenu(self)
+
+                    # Split action
                     split_action = QAction("Split at Playhead", self)
                     split_action.triggered.connect(lambda _, cid=clip.clip_id: self.split_requested.emit(cid))
                     menu.addAction(split_action)
+
+                    menu.addSeparator()
+
+                    # Delete action (leaves gap)
+                    delete_action = QAction("Delete", self)
+                    delete_action.setShortcut("Delete")
+                    delete_action.triggered.connect(lambda _, cid=clip.clip_id: self.clip_delete_requested.emit(cid))
+                    menu.addAction(delete_action)
+
+                    # Ripple delete action (closes gap)
+                    ripple_delete_action = QAction("Ripple Delete", self)
+                    ripple_delete_action.setShortcut("Shift+Delete")
+                    ripple_delete_action.triggered.connect(lambda _, cid=clip.clip_id: self.clip_ripple_delete_requested.emit(cid))
+                    menu.addAction(ripple_delete_action)
+
                     menu.exec(self.mapToGlobal(event.position().toPoint()))
                     return
             return
@@ -426,6 +659,82 @@ class TimelineTrack(QWidget):
 
         return (min_bound, max_bound)
 
+    def _check_clip_overlap(self, target_clip: TimelineClip) -> bool:
+        """Check if target_clip overlaps with any other clip on this track.
+
+        Args:
+            target_clip: The clip to check for overlaps
+
+        Returns:
+            True if overlap detected, False otherwise
+        """
+        clip_start = target_clip.timeline_start
+        clip_end = target_clip.timeline_start + target_clip.duration
+        epsilon = 0.001  # Small tolerance for floating point comparisons
+
+        for clip in self.clips:
+            if clip.clip_id == target_clip.clip_id:
+                continue
+
+            other_start = clip.timeline_start
+            other_end = clip.timeline_start + clip.duration
+
+            # Two clips overlap if one starts before the other ends AND ends after the other starts
+            # Use epsilon tolerance to allow clips to touch without overlapping
+            if clip_start < other_end - epsilon and clip_end > other_start + epsilon:
+                return True
+
+        return False
+
+    def _find_snap_point(self, position: float, exclude_clip_id: str, edge_type: str = 'start') -> Optional[float]:
+        """Find a snap point near the given position.
+
+        Checks for snap points at:
+        - Other clips' start and end edges
+        - The playhead position
+
+        Args:
+            position: The timeline position to check (in seconds)
+            exclude_clip_id: Clip ID to exclude from snap candidates
+            edge_type: 'start' or 'end' - which edge of the clip is being dragged
+
+        Returns:
+            The snapped position if a snap point is found, None otherwise
+        """
+        threshold_seconds = self.SNAP_THRESHOLD_PX / self._pixels_per_second
+
+        # Collect all snap points
+        snap_points: List[float] = []
+
+        # Add other clips' edges as snap points
+        for clip in self.clips:
+            if clip.clip_id == exclude_clip_id:
+                continue
+            # Clip start edge
+            snap_points.append(clip.timeline_start)
+            # Clip end edge
+            snap_points.append(clip.timeline_start + clip.duration)
+
+        # Add playhead position as a snap point
+        parent = self.parent()
+        while parent:
+            if isinstance(parent, TimelineWidget):
+                snap_points.append(parent._playhead_position)
+                break
+            parent = parent.parent()
+
+        # Find the closest snap point within threshold
+        closest_snap = None
+        closest_distance = threshold_seconds
+
+        for snap_point in snap_points:
+            distance = abs(position - snap_point)
+            if distance < closest_distance:
+                closest_distance = distance
+                closest_snap = snap_point
+
+        return closest_snap
+
     def _notify_clip_selected(self, clip_id: str):
         """Notify parent TimelineWidget when a clip becomes selected."""
         parent = self.parent()
@@ -473,6 +782,11 @@ class TimelineTrack(QWidget):
                 new_start = self._drag_clip_initial_start + delta_time
                 new_start = max(min_bound, min(new_start, max_bound))
 
+                # Apply snapping for the left edge (start)
+                snap_point = self._find_snap_point(new_start, self._drag_clip_id, 'start')
+                if snap_point is not None and min_bound <= snap_point <= max_bound:
+                    new_start = snap_point
+
                 target_clip.timeline_start = new_start
                 target_clip.start_time = self._drag_clip_source_start + (new_start - self._drag_clip_initial_start)
                 target_clip.end_time = self._drag_clip_source_end
@@ -487,34 +801,43 @@ class TimelineTrack(QWidget):
                 new_end = self._drag_clip_initial_start + self._drag_clip_initial_duration + delta_time
                 new_end = max(min_bound, min(new_end, max_bound))
 
+                # Apply snapping for the right edge (end)
+                snap_point = self._find_snap_point(new_end, self._drag_clip_id, 'end')
+                if snap_point is not None and min_bound <= snap_point <= max_bound:
+                    new_end = snap_point
+
                 target_clip.duration = max(min_duration, new_end - self._drag_clip_initial_start)
                 target_clip.end_time = target_clip.start_time + target_clip.duration
                 # Clamp fade durations to new clip duration
                 target_clip.clamp_fade_durations()
                 self.update()
             else:
+                # Move mode: allow free movement during drag, no collision blocking
+                # Only update UI; service layer updated only on drop
                 new_start = max(0, self._drag_clip_initial_start + delta_time)
+                clip_end = new_start + target_clip.duration
 
-                # Collision detection
-                min_start = 0
-                max_start = float('inf')
+                # Apply snapping for both edges during move
+                snap_start = self._find_snap_point(new_start, self._drag_clip_id, 'start')
+                snap_end = self._find_snap_point(clip_end, self._drag_clip_id, 'end')
 
-                for clip in self.clips:
-                    if clip.clip_id == self._drag_clip_id:
-                        continue
+                # Prefer the closer snap point
+                if snap_start is not None and snap_end is not None:
+                    # Check which is closer and apply that snap
+                    if abs(new_start - snap_start) <= abs(clip_end - snap_end):
+                        new_start = snap_start
+                    else:
+                        new_start = snap_end - target_clip.duration
+                elif snap_start is not None:
+                    new_start = snap_start
+                elif snap_end is not None:
+                    new_start = snap_end - target_clip.duration
 
-                    # If clip is to the left
-                    if clip.timeline_start + clip.duration <= self._drag_clip_initial_start:
-                        min_start = max(min_start, clip.timeline_start + clip.duration)
-                    # If clip is to the right
-                    elif clip.timeline_start >= self._drag_clip_initial_start + target_clip.duration:
-                        max_start = min(max_start, clip.timeline_start - target_clip.duration)
-
-                new_start = max(min_start, min(new_start, max_start))
+                # Ensure start is not negative
+                new_start = max(0, new_start)
 
                 if new_start != target_clip.timeline_start:
                     target_clip.timeline_start = new_start
-                    self.clip_moved.emit(self._drag_clip_id, new_start)
                     self.update()
         elif self._is_dragging_playhead:
             # Drag playhead
@@ -564,7 +887,16 @@ class TimelineTrack(QWidget):
                     new_end = target_clip.timeline_start + target_clip.duration
                     self.clip_trimmed.emit(target_clip.clip_id, new_start, new_end)
                 elif self._drag_mode == "move":
-                    self.clip_moved.emit(target_clip.clip_id, target_clip.timeline_start)
+                    # Check for overlap with other clips on same track
+                    if self._check_clip_overlap(target_clip):
+                        # Overlap detected: revert to original position
+                        target_clip.timeline_start = self._drag_clip_initial_start
+                        self.update()
+                        # Emit with original position to sync service layer
+                        self.clip_moved.emit(self._drag_clip_id, self._drag_clip_initial_start)
+                    else:
+                        # No overlap: commit the new position
+                        self.clip_moved.emit(target_clip.clip_id, target_clip.timeline_start)
 
         self._is_dragging_clip = False
         self._is_dragging_playhead = False
@@ -581,6 +913,20 @@ class TimelineTrack(QWidget):
             self._hovered_fade_clip_id = None
             self._hovered_fade_type = 'none'
             self.update()
+
+    def keyPressEvent(self, event: QKeyEvent):
+        """Handle keyboard events for clip deletion."""
+        if self._selected_clip_id:
+            if event.key() == Qt.Key.Key_Delete:
+                if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                    # Shift+Delete: ripple delete
+                    self.clip_ripple_delete_requested.emit(self._selected_clip_id)
+                else:
+                    # Delete: delete leaving gap
+                    self.clip_delete_requested.emit(self._selected_clip_id)
+                event.accept()
+                return
+        super().keyPressEvent(event)
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         """Handle drag enter event."""
@@ -1046,7 +1392,14 @@ class TimelineWidget(QWidget):
     clip_volume_changed = pyqtSignal(str, float)  # clip_id, volume (0.0 to 2.0)
     clip_mute_toggled = pyqtSignal(str)  # clip_id
     clip_fade_changed = pyqtSignal(str, float, float)  # clip_id, fade_in_duration, fade_out_duration
-    
+    clip_delete_requested = pyqtSignal(str)  # clip_id - delete leaving gap
+    clip_ripple_delete_requested = pyqtSignal(str)  # clip_id - ripple delete (close gap)
+    play_pause_requested = pyqtSignal()  # Request to toggle play/pause
+    playhead_step_requested = pyqtSignal(float)  # Step playhead by seconds (positive = forward, negative = backward)
+    split_at_playhead_requested = pyqtSignal()  # Split selected clip or clip at playhead
+    detach_audio_shortcut_requested = pyqtSignal()  # Detach audio shortcut
+    clip_speed_requested = pyqtSignal(str, float)  # clip_id, speed - request to change clip speed
+
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
         
@@ -1060,7 +1413,62 @@ class TimelineWidget(QWidget):
 
         # Keep a single selected clip across all tracks.
         self.clip_selected.connect(self._sync_selected_clip_across_tracks)
-    
+
+        # Enable keyboard focus for delete key handling
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def keyPressEvent(self, event: QKeyEvent):
+        """Handle keyboard events for timeline shortcuts."""
+        # Space: Toggle play/pause
+        if event.key() == Qt.Key.Key_Space:
+            self.play_pause_requested.emit()
+            event.accept()
+            return
+
+        # Left/Right arrows: Move playhead
+        if event.key() == Qt.Key.Key_Left:
+            step = -0.1  # 100ms backward
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                step = -1.0  # 1 second backward with Shift
+            self.playhead_step_requested.emit(step)
+            event.accept()
+            return
+
+        if event.key() == Qt.Key.Key_Right:
+            step = 0.1  # 100ms forward
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                step = 1.0  # 1 second forward with Shift
+            self.playhead_step_requested.emit(step)
+            event.accept()
+            return
+
+        # C: Split at playhead
+        if event.key() == Qt.Key.Key_C and not event.modifiers():
+            self.split_at_playhead_requested.emit()
+            event.accept()
+            return
+
+        # Ctrl+D: Detach audio
+        if event.key() == Qt.Key.Key_D and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            self.detach_audio_shortcut_requested.emit()
+            event.accept()
+            return
+
+        # Delete/Shift+Delete: Delete clip
+        selected_clip_id = self._get_selected_clip_id()
+        if selected_clip_id:
+            if event.key() == Qt.Key.Key_Delete:
+                if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                    # Shift+Delete: ripple delete
+                    self.clip_ripple_delete_requested.emit(selected_clip_id)
+                else:
+                    # Delete: delete leaving gap
+                    self.clip_delete_requested.emit(selected_clip_id)
+                event.accept()
+                return
+
+        super().keyPressEvent(event)
+
     def _setup_ui(self):
         """Setup the widget UI."""
         layout = QVBoxLayout(self)
@@ -1137,6 +1545,15 @@ class TimelineWidget(QWidget):
         self.volume_label.setObjectName("timeLabel")
         self.volume_label.setMinimumWidth(35)
         header_layout.addWidget(self.volume_label)
+
+        # Speed button
+        self.speed_btn = QPushButton()
+        self.speed_btn.setToolTip("Set playback speed for selected clip")
+        self.speed_btn.setFixedSize(24, 22)
+        self.speed_btn.setText("1x")
+        self.speed_btn.setStyleSheet("background-color: #3a3a3a; border: 1px solid #555555; padding: 0px; font-size: 9px;")
+        self.speed_btn.clicked.connect(self._on_speed_button_clicked)
+        header_layout.addWidget(self.speed_btn)
 
         self._set_audio_controls_enabled(False)
         
@@ -1250,6 +1667,8 @@ class TimelineWidget(QWidget):
         track.clip_volume_changed.connect(self.clip_volume_changed.emit)
         track.clip_mute_toggled.connect(self.clip_mute_toggled.emit)
         track.clip_fade_changed.connect(self._on_clip_fade_changed)
+        track.clip_delete_requested.connect(self.clip_delete_requested.emit)
+        track.clip_ripple_delete_requested.connect(self.clip_ripple_delete_requested.emit)
         
         # Track header
         track_header = QWidget()
@@ -1356,6 +1775,44 @@ class TimelineWidget(QWidget):
             return
         self.clip_mute_toggled.emit(clip.clip_id)
 
+    def _on_speed_button_clicked(self):
+        """Handle speed button click - show dialog to set clip speed."""
+        selected_clip_id = self._get_selected_clip_id()
+        if not selected_clip_id:
+            return
+
+        # Find the clip to get current speed
+        clip = None
+        for track in self._tracks:
+            for c in track.clips:
+                if c.clip_id == selected_clip_id:
+                    clip = c
+                    break
+            if clip:
+                break
+
+        if not clip:
+            return
+
+        current_speed = getattr(clip, 'speed', 1.0)
+
+        # Show custom speed dialog with slider
+        dialog = SpeedDialog(current_speed, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            speed = dialog.get_speed()
+            self.clip_speed_requested.emit(selected_clip_id, speed)
+
+    def update_speed_button_for_clip(self, clip: Optional[TimelineClip]):
+        """Update speed button display for selected clip."""
+        if not clip:
+            self.speed_btn.setText("1x")
+            self.speed_btn.setToolTip("Set playback speed for selected clip")
+            return
+
+        speed = getattr(clip, 'speed', 1.0)
+        self.speed_btn.setText(f"{speed:.1f}x")
+        self.speed_btn.setToolTip(f"Current speed: {speed:.2f}x (click to change)")
+
     def update_mute_button_state(self, muted: bool):
         """Update mute button icon for selected clip state."""
         self.mute_btn.setIcon(_create_muted_icon() if muted else _create_speaker_icon())
@@ -1370,6 +1827,7 @@ class TimelineWidget(QWidget):
             self.volume_label.setText("100%")
             self.volume_slider.setToolTip("Volume: 100%")
             self.update_mute_button_state(False)
+            self.update_speed_button_for_clip(None)
             return
 
         selected_clip_id = self._get_selected_clip_id()
@@ -1388,6 +1846,7 @@ class TimelineWidget(QWidget):
         self.volume_label.setText(f"{volume_pct}%")
         self.volume_slider.setToolTip(f"Volume: {volume_pct}%")
         self.update_mute_button_state(bool(getattr(clip, "muted", False)))
+        self.update_speed_button_for_clip(clip)
 
     def _get_selected_clip_id(self) -> Optional[str]:
         """Get selected clip id from tracks."""
